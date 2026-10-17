@@ -106,6 +106,16 @@ pub struct WorkerProcessArgs {
     /// worker's attention registry owns the names and refuses one it does
     /// not provide; `auto` lets it select per call.
     pub attention_backend: String,
+    /// Exact model module paths and their attention provider overrides.
+    pub attention_overrides: std::collections::BTreeMap<String, String>,
+    /// Grid attention segment provider; `auto` selects by device.
+    pub grid_attention_backend: String,
+    /// Matrix multiplication provider; `auto` selects by weight encoding and device.
+    pub matmul_backend: String,
+    /// Explicit cuDNN convolution plan files, keyed by model component.
+    pub convolution_plans: std::collections::BTreeMap<String, std::path::PathBuf>,
+    /// Per-backend CUDA BLAS workspace limit in bytes; None keeps library defaults.
+    pub blas_workspace_size: Option<usize>,
     /// Product transport exposed by the worker pool.
     pub transfer: crate::executor::TransferConfig,
     /// Checkpoint loader format.

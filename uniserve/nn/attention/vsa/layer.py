@@ -10,7 +10,7 @@ from torch import nn
 
 from uniserve.nn import _binding
 
-from .inputs import BlockInput
+from .inputs import BlockInput, Recipe
 
 
 class BlockAttention(nn.Module):
@@ -18,14 +18,18 @@ class BlockAttention(nn.Module):
 
     Each block input declares the rows of its query tiles and key blocks
     (``Pattern.tile``), and the backend that evaluates it is resolved for
-    that tile.
+    that tile. An explicit ``recipe`` also fixes the observable arithmetic
+    schedule; unsupported providers fail rather than silently substituting
+    another schedule.
     """
 
-    def __init__(self, scale: float):
+    def __init__(self, scale: float, *, recipe: Recipe | None = None):
         super().__init__()
         if not math.isfinite(scale) or scale <= 0:
             raise ValueError("VSA requires a positive scale")
-        self.scale = scale
+        if recipe is not None and not isinstance(recipe, Recipe):
+            raise TypeError("VSA requires a typed numerical recipe")
+        self.scale, self.recipe = scale, recipe
 
     @contextmanager
     def _operator(self, q, batch):
@@ -34,7 +38,7 @@ class BlockAttention(nn.Module):
         """  # noqa: D205
         binding = _binding.vsa.get().get(id(self))
         if binding is not None:
-            yield binding.prepare(batch.pattern, q)
+            yield binding.prepare(batch.pattern, q, recipe=self.recipe)
             return
 
         from uniserve.runtime.backends.attention import vsa
@@ -42,7 +46,9 @@ class BlockAttention(nn.Module):
 
         if q.is_cuda and torch.cuda.is_current_stream_capturing():
             raise RuntimeError("bind and prepare VSA before CUDA graph capture")
-        provider = vsa.resolve("auto", device=q.device, tile=batch.pattern.tile)
+        provider = vsa.resolve(
+            "auto", device=q.device, tile=batch.pattern.tile, recipe=self.recipe
+        )
         options = {
             "num_heads": q.shape[1],
             "head_dim": q.shape[2],
@@ -51,7 +57,10 @@ class BlockAttention(nn.Module):
         requirements = provider.workspace_buffers(batch.pattern, **options)
         buffers = TensorBuffers.allocate(requirements, device=q.device)
         operator = provider.prepare(
-            batch.pattern, **options, workspace=buffers.view(requirements)
+            batch.pattern,
+            **options,
+            workspace=buffers.view(requirements),
+            recipe=self.recipe,
         )
         try:
             operator.bind(batch)

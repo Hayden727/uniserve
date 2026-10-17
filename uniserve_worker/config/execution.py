@@ -18,6 +18,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, cast
 
+from uniserve.runtime.backends.attention import BACKENDS as ATTENTION_BACKENDS
 from uniserve.runtime.backends.attention.flashinfer import (
     Config as FlashInferConfig,
 )
@@ -320,6 +321,20 @@ class WorkerConfig:
     block_size: int | None = None
     max_total_tokens: int | None = None
     attention_backend: str | None = None
+    # Exact paths in the loaded model; the executor resolves these to borrowed
+    # numerical Attention modules, independently for each execution context.
+    attention_overrides: tuple[tuple[str, str], ...] = ()
+    # Dense segment provider used by every grid attention composition.
+    grid_attention_backend: str = "auto"
+    # Each numerical context binds this provider independently; auto selects
+    # by the weight's encoding and device without process-global overrides.
+    matmul_backend: str = "auto"
+    # Component-local numerical plans; execution contexts own their handles
+    # and workspace. An empty tuple keeps torch's convolution selection.
+    convolution_plans: tuple[tuple[str, str], ...] = ()
+    # Process-wide per-backend CUDA BLAS workspace limit, applied before model
+    # loading or graph preparation; None preserves PyTorch's defaults.
+    blas_workspace_size: int | None = None
     max_batch_calls: int
     max_batch_tokens: int
     max_model_len: int
@@ -393,6 +408,50 @@ class WorkerConfig:
         """
         if not self.device:
             raise invalid_descriptor("worker device must be named")
+        if len(dict(self.attention_overrides)) != len(
+            self.attention_overrides
+        ) or any(
+            not isinstance(path, str)
+            or not path
+            or any(not part for part in path.split("."))
+            or not isinstance(provider, str)
+            or provider not in ATTENTION_BACKENDS
+            for path, provider in self.attention_overrides
+        ):
+            raise invalid_descriptor(
+                "attention overrides require distinct module paths "
+                "and known provider names"
+            )
+        if not isinstance(self.grid_attention_backend, str) or (
+            self.grid_attention_backend
+            not in {"auto", "torch", "flash_attn_4", "flash_attn_4_sm100"}
+        ):
+            raise invalid_descriptor(
+                "grid attention backend must be auto, torch, flash_attn_4 "
+                "or flash_attn_4_sm100"
+            )
+        if self.matmul_backend not in {"auto", "torch", "cublas", "flashinfer"}:
+            raise invalid_descriptor(
+                "matmul backend must be auto, torch, cublas or flashinfer"
+            )
+        if (
+            self.blas_workspace_size is not None
+            and self.blas_workspace_size < 0
+        ):
+            raise invalid_descriptor("BLAS workspace size must not be negative")
+        if len(dict(self.convolution_plans)) != len(
+            self.convolution_plans
+        ) or any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(path, str)
+            or not path
+            for name, path in self.convolution_plans
+        ):
+            raise invalid_descriptor(
+                "convolution plans require distinct component names "
+                "and file paths"
+            )
         if self.world_size < 1 or not 0 <= self.rank < self.world_size:
             raise invalid_descriptor(
                 "worker configuration process rank is invalid"
@@ -480,6 +539,21 @@ def worker_config_from_namespace(
         canvas_sampling=_canvas_sampling(namespace.canvas_sampling),
         max_total_tokens=_optional_int(namespace.max_total_tokens),
         attention_backend=str(namespace.attention_backend),
+        grid_attention_backend=namespace.grid_attention_backend,
+        attention_overrides=tuple(
+            sorted(
+                _map(
+                    namespace.attention_overrides, "attention_overrides"
+                ).items()
+            )
+        ),
+        matmul_backend=str(namespace.matmul_backend),
+        blas_workspace_size=_optional_int(namespace.blas_workspace_size),
+        convolution_plans=tuple(
+            sorted(
+                _map(namespace.convolution_plans, "convolution_plans").items()
+            )
+        ),
         model_dtype=str(namespace.model_dtype),
         kv_cache_dtype=namespace.kv_cache_dtype,
         mem_fraction_static=float(namespace.mem_fraction_static),

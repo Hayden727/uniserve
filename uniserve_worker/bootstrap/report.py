@@ -34,6 +34,7 @@ from uniserve.model import (
     VideoEncoder,
     VideoPostprocessor,
 )
+from uniserve.model.camera import CameraDenoiser
 from uniserve.processing import ImageProcessor
 from uniserve.runtime.kv_cache import Planes
 from uniserve.tensors import BufferConfig
@@ -89,6 +90,7 @@ from uniserve_worker.model_executor.resources import media_state_buffers
 from uniserve_worker.protocol.call import CALL_KINDS
 from uniserve_worker.protocol.transfer import WorkerEndpoint
 from uniserve_worker.protocol.worker_info import (
+    CameraLayout,
     ComponentInfo,
     FrameClips,
     ServedCanvas,
@@ -628,16 +630,31 @@ def frame_clips(
     Raises:
         ValueError: The model has no video encoder to state its latent frames.
     """
+    if (
+        isinstance(denoiser, CameraDenoiser)
+        and denoiser.camera_video is not None
+    ):
+        layout = denoiser.camera_video
+        return FrameClips(
+            layout.frames_per_view,
+            layout.frames_per_view,
+            layout.latent_frames_per_view,
+            0,
+        )
     if encoder is None:
         raise ValueError("a video model must declare its video encoder")
     minimum = denoiser.legal_frame_count(1)
     clip = denoiser.legal_frame_count(minimum + 1) - minimum
-    whole, *_, final = encoder.latent_slices(minimum)
+    segments = encoder.latent_slices(minimum)
+    whole = segments[0]
+    # Independently encoded clips have no overlap tail. Overlapping VAEs
+    # describe the additional latent tail as a second segment.
+    tail = 0 if len(segments) == 1 else segments[-1].stop - segments[-1].start
     return FrameClips(
         min_frames=minimum,
         clip_frames=clip,
         clip_latent_frames=whole.stop - whole.start,
-        tail_latent_frames=final.stop - final.start,
+        tail_latent_frames=tail,
     )
 
 
@@ -667,11 +684,14 @@ def video_denoiser_info(
     names = {size: name for name, size in denoiser.canvases.items()}
     served = canvases or tuple(denoiser.canvases.values())
     shifts = denoiser.schedule_shifts
+    camera = (
+        denoiser.camera_video if isinstance(denoiser, CameraDenoiser) else None
+    )
     return VideoDenoiserInfo(
         tasks=denoiser.tasks,
         schedule_points=denoiser.num_steps + 1,
         video_shift=float(shifts["video"]),
-        audio_shift=float(shifts["audio"]),
+        audio_shift=float(shifts["audio"]) if audio_sample_rate else 0.0,
         frame_rate=frame_rate,
         audio_sample_rate=audio_sample_rate,
         frames=frames,
@@ -680,6 +700,15 @@ def video_denoiser_info(
             for canvas in served
         ),
         references=denoiser.max_references,
+        camera_layout=None
+        if camera is None
+        else CameraLayout(
+            camera.grid.views,
+            camera.grid.columns,
+            camera.grid.order,
+            camera.frames_per_view,
+            camera.latent_frames_per_view,
+        ),
     )
 
 
@@ -745,6 +774,7 @@ def _request_tensor_worker_layout(
             media_components=media_components(
                 model, worker_config.deployment_components
             ),
+            camera_outputs=capability(model, CameraDenoiser) is not None,
         ),
         max_unresolved_calls=unresolved_window,
         media_components=dict(

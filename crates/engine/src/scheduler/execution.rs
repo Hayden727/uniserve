@@ -552,10 +552,12 @@ impl Scheduler {
         if !state.audio_encoding_scheduled && state.audio.as_ref().is_some_and(produced) {
             ready.push(MediaCall::AudioEncoding);
         }
-        if state.scheduled_decode_units < sampling.video_units {
+        if graph.runs(MediaCall::VideoDecoding)
+            && state.scheduled_decode_units < sampling.video_units
+        {
             ready.push(MediaCall::VideoDecoding);
         }
-        if !state.audio_decoding_scheduled {
+        if graph.runs(MediaCall::AudioDecoding) && !state.audio_decoding_scheduled {
             ready.push(MediaCall::AudioDecoding);
         }
         // The muxer consumes media units as they arrive: a muxing call takes
@@ -565,8 +567,10 @@ impl Scheduler {
         // writes, never just their scheduled counts.
         if !state.muxing_in_flight && !state.muxed {
             let next_round_ready = state.encoded_ready.contains_key(&state.handed_units);
-            let everything_in = state.audio_encoded
-                && state.handed_units == sampling.video_units
+            let everything_in = state.denoising.is_complete()
+                && (!state.graph.runs(MediaCall::AudioEncoding) || state.audio_encoded)
+                && (!state.graph.runs(MediaCall::VideoEncoding)
+                    || state.handed_units == sampling.video_units)
                 && !state.final_muxing_scheduled;
             if next_round_ready || everything_in {
                 ready.push(MediaCall::Muxing);
@@ -1129,12 +1133,25 @@ impl Scheduler {
                 ]
             }
             // The muxer takes the completed encode rounds that follow the
-            // last it was handed, in media unit order; the final call
-            // carries none.
-            MediaCall::Muxing => Self::ready_encode_rounds(state)
-                .into_iter()
-                .map(|cursor| state.encoded_units[&cursor].1.clone())
-                .collect(),
+            // last it was handed, in media unit order. Camera finalization
+            // borrows native latents; other final calls carry no inputs.
+            MediaCall::Muxing => {
+                let rounds = Self::ready_encode_rounds(state);
+                if rounds.is_empty() && state.request.camera.is_some() {
+                    vec![
+                        state
+                            .latents
+                            .first()
+                            .ok_or("camera finalization requires native latents")?
+                            .clone(),
+                    ]
+                } else {
+                    rounds
+                        .into_iter()
+                        .map(|cursor| state.encoded_units[&cursor].1.clone())
+                        .collect()
+                }
+            }
             _ => Vec::new(),
         };
 
@@ -1171,7 +1188,9 @@ impl Scheduler {
             MediaCall::LatentEncoding => declared.push((product::CONDITION_AUDIO_LATENTS, None)),
             MediaCall::Denoising if last_step => {
                 declared.push((product::VIDEO_LATENTS, None));
-                declared.push((product::AUDIO_LATENTS, None));
+                if state.graph.product(product::AUDIO_LATENTS).is_some() {
+                    declared.push((product::AUDIO_LATENTS, None));
+                }
             }
             // A media unit round writes its own slice of the track's
             // reservation, whether the slice holds decoded media units or
@@ -1332,6 +1351,9 @@ impl Scheduler {
                 let rounds = Self::ready_encode_rounds(state);
                 if rounds.is_empty() {
                     state.final_muxing_scheduled = true;
+                    if state.request.camera.is_some() {
+                        state.muxing_inputs.extend(call.inputs.iter().cloned());
+                    }
                 }
                 for cursor in rounds {
                     let units = state
@@ -2507,10 +2529,15 @@ impl Scheduler {
             TerminalIntent::Failure(_) | TerminalIntent::Rejected(_)
         );
 
-        // Only the final muxing call, the one that carries no media units,
-        // returns the artifact; every other call returns none.
+        // Only the final muxing call returns the artifact. It borrows native
+        // camera latents or carries no inputs for an ordinary video request.
         let media_output_valid = if call.kind == CallKind::Media(MediaCall::Muxing) {
-            media.is_some() == call.inputs.is_empty()
+            let final_call = if state.request.camera.is_some() {
+                call.inputs.len() == 1 && call.inputs.first() == state.latents.first()
+            } else {
+                call.inputs.is_empty()
+            };
+            media.is_some() == final_call
         } else {
             media.is_none()
         };
@@ -2650,7 +2677,12 @@ impl Scheduler {
                 if let Some(media) = media {
                     state.artifact = Some(ArtifactEvent {
                         media_kind: MediaKind::Video,
-                        content_type: "video/mp4".to_string(),
+                        content_type: if state.request.camera.is_some() {
+                            "application/zip"
+                        } else {
+                            "video/mp4"
+                        }
+                        .to_string(),
                         media,
                     });
                 }

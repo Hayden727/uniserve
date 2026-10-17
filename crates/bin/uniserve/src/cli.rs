@@ -160,8 +160,8 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long = "max-model-len")]
     pub max_model_len: Option<u32>,
     /// Longest video duration, in seconds, a media deployment provisions and
-    /// admits: a capacity within the video API's [4, 15] second range,
-    /// advertised as `max_seconds`.
+    /// admits, advertised as `max_seconds`. Ordinary video uses [4, 15]
+    /// seconds; camera deployments may provision longer multi-view outputs.
     #[arg(long = "max-video-seconds", default_value_t = MAX_VIDEO_SECONDS)]
     pub max_video_seconds: f64,
     /// Most denoiser rows the conditions of one video request may take: a
@@ -226,6 +226,29 @@ pub(crate) struct SharedRuntimeArgs {
     /// name its attention registry gives it; `auto` selects per call.
     #[arg(long, default_value = WorkerProcessArgs::DEFAULT_ATTENTION_BACKEND)]
     pub attention_backend: String,
+    /// JSON map of exact model module paths to attention provider names.
+    #[arg(long, value_parser = parse_json::<std::collections::BTreeMap<String, String>>, value_name = "JSON", default_value = "{}")]
+    pub attention_overrides: std::collections::BTreeMap<String, String>,
+    /// Grid attention segment provider for every numerical worker context.
+    #[arg(
+        long,
+        value_parser = ["auto", "torch", "flash_attn_4", "flash_attn_4_sm100"],
+        default_value = WorkerProcessArgs::DEFAULT_GRID_ATTENTION_BACKEND
+    )]
+    pub grid_attention_backend: String,
+    /// Matrix multiplication provider for every numerical worker context.
+    #[arg(
+        long,
+        value_parser = ["auto", "torch", "cublas", "flashinfer"],
+        default_value = WorkerProcessArgs::DEFAULT_MATMUL_BACKEND
+    )]
+    pub matmul_backend: String,
+    /// JSON map of component names to explicit cuDNN convolution plan files.
+    #[arg(long, value_parser = parse_json::<std::collections::BTreeMap<String, std::path::PathBuf>>, value_name = "JSON", default_value = "{}")]
+    pub convolution_plans: std::collections::BTreeMap<String, std::path::PathBuf>,
+    /// Maximum workspace bytes for each CUDA BLAS backend; zero excludes workspace-dependent algorithms.
+    #[arg(long)]
+    pub blas_workspace_size: Option<usize>,
     /// Python interpreter used to launch the forward-only worker.
     #[arg(long, default_value_os_t = default_worker_python(), hide = true)]
     pub worker_python: std::path::PathBuf,
@@ -483,6 +506,11 @@ impl SharedRuntimeArgs {
         worker_process.max_total_tokens = self.max_total_tokens;
         worker_process.block_size = self.block_size;
         worker_process.attention_backend = self.attention_backend.clone();
+        worker_process.grid_attention_backend = self.grid_attention_backend.clone();
+        worker_process.matmul_backend = self.matmul_backend.clone();
+        worker_process.attention_overrides = self.attention_overrides.clone();
+        worker_process.convolution_plans = self.convolution_plans.clone();
+        worker_process.blas_workspace_size = self.blas_workspace_size;
 
         EngineSettings {
             max_batch: self.max_batch.unwrap_or(DEFAULT_MAX_BATCH),
@@ -809,7 +837,80 @@ mod tests {
     #[test]
     fn serve_accepts_automatic_model_detection() {
         let result = <Cli as clap::Parser>::try_parse_from(["uniserve", "serve", "model"]);
-        assert!(result.is_ok());
+        let Command::Serve(args) = result.unwrap().command;
+        let settings = args.runtime.engine_settings();
+        assert_eq!(settings.worker_process.grid_attention_backend, "auto");
+    }
+
+    #[test]
+    fn serve_preserves_grid_attention_provider_configuration() {
+        for provider in ["auto", "torch", "flash_attn_4", "flash_attn_4_sm100"] {
+            let parsed = <Cli as clap::Parser>::try_parse_from([
+                "uniserve",
+                "serve",
+                "model",
+                "--grid-attention-backend",
+                provider,
+            ])
+            .expect("explicit grid attention provider");
+            let Command::Serve(args) = parsed.command;
+            let settings = args.runtime.engine_settings();
+            assert_eq!(settings.worker_process.grid_attention_backend, provider);
+        }
+    }
+
+    #[test]
+    fn serve_rejects_unknown_grid_attention_providers() {
+        let result = <Cli as clap::Parser>::try_parse_from([
+            "uniserve",
+            "serve",
+            "model",
+            "--grid-attention-backend",
+            "unknown",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serve_preserves_numerical_backend_configuration() {
+        let parsed = <Cli as clap::Parser>::try_parse_from([
+            "uniserve",
+            "serve",
+            "model",
+            "--matmul-backend",
+            "torch",
+            "--attention-overrides",
+            r#"{"transformer.network.blocks.0.cam_self_attn.attn":"flash_attn_4"}"#,
+            "--convolution-plans",
+            r#"{"video_encoder":"/models/encoder-plans.json"}"#,
+            "--blas-workspace-size",
+            "0",
+        ])
+        .expect("explicit numerical backend configuration");
+        let Command::Serve(args) = parsed.command;
+        let settings = args.runtime.engine_settings();
+        assert_eq!(settings.worker_process.blas_workspace_size, Some(0));
+        assert_eq!(settings.worker_process.matmul_backend, "torch");
+        assert_eq!(
+            settings.worker_process.attention_overrides["transformer.network.blocks.0.cam_self_attn.attn"],
+            "flash_attn_4"
+        );
+        assert_eq!(
+            settings.worker_process.convolution_plans["video_encoder"],
+            std::path::PathBuf::from("/models/encoder-plans.json")
+        );
+    }
+
+    #[test]
+    fn serve_rejects_unknown_matmul_providers() {
+        let result = <Cli as clap::Parser>::try_parse_from([
+            "uniserve",
+            "serve",
+            "model",
+            "--matmul-backend",
+            "unknown",
+        ]);
+        assert!(result.is_err());
     }
 
     #[test]

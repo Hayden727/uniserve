@@ -178,7 +178,9 @@ impl ExecutorInfo {
             }
         }
         if routing.contains_key(&MediaCall::Muxing) {
-            let missing = crate::scheduler::graph::task_calls(uniserve_core::VideoTask::T2va)
+            // Every video pipeline has these calls. Task-specific audio and
+            // condition calls are checked against the denoiser handshake.
+            let missing = crate::scheduler::graph::task_calls(uniserve_core::VideoTask::Camera2v)
                 .into_iter()
                 .filter(|call| !routing.contains_key(call))
                 .map(|call| format!("{call:?}"))
@@ -1410,6 +1412,7 @@ mod tests {
                 audio_shift: 3.0,
                 frame_rate: 24,
                 audio_sample_rate: 32_000,
+                camera_layout: None,
                 frames: uniserve_worker_ipc::FrameClips {
                     min_frames: 22,
                     clip_frames: 17,
@@ -1643,6 +1646,7 @@ mod tests {
                 audio_shift: 3.0,
                 frame_rate: 24,
                 audio_sample_rate: 32_000,
+                camera_layout: None,
                 frames: uniserve_worker_ipc::FrameClips {
                     min_frames: 22,
                     clip_frames: 17,

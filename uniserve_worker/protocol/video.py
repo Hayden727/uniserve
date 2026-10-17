@@ -19,6 +19,7 @@ from enum import StrEnum
 from uniserve.media import image
 from uniserve.media import video as media_video
 from uniserve.model import ConditionRole
+from uniserve.model.camera import CameraGrid
 
 
 class VideoTask(StrEnum):
@@ -27,6 +28,7 @@ class VideoTask(StrEnum):
     T2VA = "t2va"
     FL2VA = "fl2va"
     REF2VA = "ref2va"
+    CAMERA2V = "camera2v"
 
 
 #: The presentation tag of a vision token or vision marker; every other
@@ -46,6 +48,22 @@ class MediaLocator:
     name: str
     # Published byte count.
     bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class CameraInput:
+    """Immutable camera tensor archive and the latent grid it conditions."""
+
+    source: MediaLocator
+    views: int
+    columns: int
+    order: str
+    clean_cells: tuple[int, ...]
+    include_video: bool = False
+
+    @property
+    def grid(self):
+        return CameraGrid(self.views, self.columns, self.order)
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +185,7 @@ class VideoAdmission:
     # vision token or vision marker, 1 for text.
     text_tags: tuple[int, ...]
     conditions: tuple[VideoCondition, ...] = ()
+    camera: CameraInput | None = None
 
     def __post_init__(self) -> None:
         # The transport states the task by its wire spelling.
@@ -189,6 +208,7 @@ class VideoAdmission:
 
 
 __all__ = [
+    "CameraInput",
     "VISION_TAG",
     "AudioClip",
     "ConditionVision",

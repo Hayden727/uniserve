@@ -8,7 +8,27 @@ from uniserve.tensors import _join_channels
 
 from .activation import GELUAndMul, SiLUAndMul
 from .functional import Rounding
-from .linear import MergedColumnParallelLinear, RowParallelLinear
+from .linear import Linear, MergedColumnParallelLinear, RowParallelLinear
+
+
+class MLP(nn.Module):
+    """Two dense projections separated by an explicit activation."""
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int,
+        out_features: int,
+        *,
+        activation: nn.Module,
+    ):
+        super().__init__()
+        self.fc_in = Linear(in_features, hidden_features)
+        self.act = activation
+        self.fc_out = Linear(hidden_features, out_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc_out(self.act(self.fc_in(x)))
 
 
 class GatedMLP(nn.Module):

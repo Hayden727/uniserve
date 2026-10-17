@@ -334,7 +334,7 @@ def test_decoder_without_prefix_storage(tmp_path):
 def test_text_encoder_retains_checkpoint_layers_and_sequence_boundaries(
     tmp_path,
 ):
-    from uniserve.model import TextEncoder
+    from uniserve.model import DecoderTextEncoder
 
     reference = qwen_checkpoint(tmp_path)
     io = loading.Config()
@@ -352,7 +352,7 @@ def test_text_encoder_retains_checkpoint_layers_and_sequence_boundaries(
     # Conditioning uses the first checkpoint layer's residual stream, before
     # subsequent decoder layers or final normalization.
     model.backbone.norm = torch.nn.Identity()
-    encoder = TextEncoder(model.backbone, retained_layers=(0,))
+    encoder = DecoderTextEncoder(model.backbone, retained_layers=(0,))
     tokens = (
         torch.tensor([1, 2, 3]),
         torch.tensor([9]),
@@ -372,7 +372,7 @@ def test_text_encoder_retains_checkpoint_layers_and_sequence_boundaries(
 
 def _partitioned_encoder(rank, rendezvous, root):
     from uniserve.distributed import DeviceMesh, parallelize_
-    from uniserve.model import TextEncoder
+    from uniserve.model import DecoderTextEncoder
     from uniserve.nn.attention import AttentionParallelConfig, Ulysses
     from uniserve.runtime import initialize_process_groups
 
@@ -397,7 +397,7 @@ def _partitioned_encoder(rank, rendezvous, root):
             device="cpu",
             weights=weights.Config(dtype=torch.float32),
         ).model
-        encoder = TextEncoder(model.backbone, retained_layers=(0, 1))
+        encoder = DecoderTextEncoder(model.backbone, retained_layers=(0, 1))
         parallelize_(
             encoder,
             mesh,

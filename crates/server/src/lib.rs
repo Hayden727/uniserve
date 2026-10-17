@@ -186,7 +186,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             );
             RequestRenderer::Chat(*renderer)
         }
-        LoadedRenderer::Video(vision) => {
+        LoadedRenderer::Video(processor) => {
             let denoiser = engine
                 .video_denoiser()
                 .context("the video worker reported no video denoiser")?;
@@ -204,7 +204,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             RequestRenderer::Video(
                 crate::serving::video::VideoService::new(
                     denoiser,
-                    vision,
+                    processor,
                     config.engine.max_video_seconds,
                     latent_encoding_lane,
                     &config.video_media,

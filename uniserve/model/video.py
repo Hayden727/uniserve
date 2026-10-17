@@ -632,6 +632,134 @@ class AudioDecoder(nn.Module):
 
 
 class VideoPostprocessor(nn.Module):
+    """Publish independent decoded clips as RGB24 in caller-owned storage.
+
+    Each input is a native NCTHW clip. ``rgb`` defines its numerical pixel
+    conversion; the default accepts floating RGB in [0, 1] and rounds to
+    bytes. Subclasses may supply a different normalization or quantization.
+    No clip carries temporal state unless an overlap subclass declares it.
+    """
+
+    def __init__(self, *, frame_rate: int):
+        super().__init__()
+        if type(frame_rate) is not int or frame_rate < 1:
+            raise ValueError("video frame rate must be a positive integer")
+        self.frame_rate = frame_rate
+        self.units = Communicator()
+
+    def output_layout(self, size: video.Config) -> Mapping[str, OutputLayout]:
+        shape = (size.num_frames, size.frame.height, size.frame.width, 3)
+        return {
+            "video": OutputLayout(
+                shape,
+                torch.uint8,
+                tuple(slice(0, n) for n in shape),
+                variable_axes=(0,),
+                value_range=(0, 255),
+            )
+        }
+
+    def state_buffers(self, size: video.Config) -> Mapping[str, BufferConfig]:
+        return {}
+
+    def constant_buffers(
+        self, size: video.Config
+    ) -> Mapping[str, BufferConfig]:
+        return {}
+
+    def prepare_constants(
+        self, size: video.Config, *, out: Mapping[str, torch.Tensor]
+    ) -> None:
+        if out:
+            raise ValueError("independent RGB reconstruction has no constants")
+
+    def workspace_buffers(
+        self, size: video.Config
+    ) -> Mapping[str, BufferConfig]:
+        layout = self.output_layout(size)["video"]
+        return {"rgb_frames": BufferConfig(layout.shape, layout.dtype)}
+
+    def rgb(self, decoded: torch.Tensor) -> torch.Tensor:
+        """Convert NCTHW floating pixels into NCTHW RGB24."""
+        return decoded.float().clamp(0, 1).mul(255).round().to(torch.uint8)
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        decoded: tuple[TensorOutput, ...],
+        *,
+        clips: tuple[slice, ...],
+        sizes: tuple[video.Config, ...],
+        state: Mapping[str, torch.Tensor],
+        constants: Mapping[str, torch.Tensor],
+        workspace: Mapping[str, torch.Tensor],
+        unit_count: int = 1,
+    ) -> tuple[TensorOutput, ...]:
+        if (
+            not decoded
+            or len(decoded) != len(clips)
+            or len(decoded) != len(sizes)
+        ):
+            raise ValueError("decoded video clips and output sizes must align")
+        if (
+            type(unit_count) is not int
+            or not 0 <= self.units.rank < unit_count <= self.units.size
+        ):
+            raise ValueError("media unit rank must lie within its round")
+        if state or constants:
+            raise ValueError(
+                "independent RGB reconstruction has no state or constants"
+            )
+        pixels = workspace["rgb_frames"]
+        cursor, result = 0, []
+        for item, clip, size in zip(decoded, clips, sizes, strict=True):
+            if (
+                clip.step not in (None, 1)
+                or clip.start is None
+                or clip.stop is None
+                or not 0 <= clip.start < clip.stop <= size.num_frames
+            ):
+                raise ValueError(
+                    "video clips must lie within their output duration"
+                )
+            count = clip.stop - clip.start
+            height, width = size.frame.height, size.frame.width
+            value = item.tensor
+            if value.ndim == 6 and value.shape[0] == 1:
+                value = value[0]
+            if value.shape != (1, 3, count, height, width):
+                raise ValueError(
+                    "independent decoded clip must cover its NCTHW interval"
+                )
+            if (
+                pixels.ndim != 4
+                or pixels.shape[1:] != (height, width, 3)
+                or pixels.shape[0] < cursor + count
+                or pixels.dtype != torch.uint8
+                or pixels.device != value.device
+            ):
+                raise ValueError(
+                    "RGB workspace must cover the output on its device"
+                )
+            output = pixels[cursor : cursor + count]
+            output.copy_(self.rgb(value)[0].permute(1, 2, 3, 0))
+            result.append(
+                TensorOutput(
+                    output,
+                    OutputLayout(
+                        (size.num_frames, height, width, 3),
+                        torch.uint8,
+                        (clip, slice(0, height), slice(0, width), slice(0, 3)),
+                        variable_axes=(0,),
+                        value_range=(0, 255),
+                    ),
+                )
+            )
+            cursor += count
+        return tuple(result)
+
+
+class OverlapPostprocessor(VideoPostprocessor):
     """Blend temporal overlaps, crop decoder padding and produce RGB24 frames.
 
     ``overlap_weights`` weights the current clip, in the decoded precision.
@@ -651,9 +779,7 @@ class VideoPostprocessor(nn.Module):
     overlap_weights: torch.Tensor
 
     def __init__(self, overlap_weights: torch.Tensor, *, frame_rate: int):
-        super().__init__()
-        if type(frame_rate) is not int or frame_rate < 1:
-            raise ValueError("video frame rate must be a positive integer")
+        super().__init__(frame_rate=frame_rate)
         if (
             overlap_weights.is_meta
             or overlap_weights.ndim != 1
@@ -668,9 +794,6 @@ class VideoPostprocessor(nn.Module):
         self.register_buffer(
             "overlap_weights", overlap_weights, persistent=False
         )
-        self.frame_rate = frame_rate
-        # Rebound by the runtime to the ranks this component is placed on.
-        self.units = Communicator()
 
     def reconstruction_slices(
         self, clip: slice, num_frames: int

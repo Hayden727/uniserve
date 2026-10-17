@@ -22,6 +22,8 @@ if TYPE_CHECKING:
         AttentionBinding,
         ExchangeBuffers,
     )
+    from uniserve.runtime.bindings.convolution import ConvolutionBinding
+    from uniserve.runtime.bindings.grid import GridBinding
     from uniserve.runtime.bindings.matmul import MatmulBinding
     from uniserve.runtime.bindings.moe import MoEBinding
     from uniserve.runtime.bindings.vsa import VsaBinding
@@ -37,6 +39,10 @@ ChunkStorage = Callable[
 # weight or module id -> prepared matmul operator
 matmul: ContextVar[Mapping[int, MatmulBinding]] = ContextVar(
     "uniserve_matmul_operators", default={}
+)
+
+convolution: ContextVar[Mapping[int, ConvolutionBinding]] = ContextVar(
+    "uniserve_convolution_operators", default={}
 )
 
 # module id, or branch key -> prepared merged operator
@@ -57,6 +63,9 @@ attention_storage: ContextVar[Mapping[int, ExchangeBuffers]] = ContextVar(
 )
 vsa: ContextVar[Mapping[int, VsaBinding]] = ContextVar(
     "uniserve_vsa_operators", default={}
+)
+grid: ContextVar[Mapping[int, GridBinding]] = ContextVar(
+    "uniserve_grid_operators", default={}
 )
 
 # FusedMoE module id -> prepared routed-expert operator

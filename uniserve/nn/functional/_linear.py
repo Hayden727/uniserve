@@ -11,16 +11,21 @@ from collections.abc import Mapping
 
 import torch
 
+from uniserve.nn.gemv import GemvReduction, validate_reduction
 from uniserve.quantization import QuantizedTensor
 
 from ._tensors import as_matrix
 
 
-def _operator(weight, x, output_dtype):
+def _operator(weight, x, output_dtype, gemv_reduction):
     """Prepare a standalone matmul operator with its own workspace."""
     from uniserve.runtime.backends.matmul import resolve
 
     provider = resolve("auto", weight)
+    if gemv_reduction != "default":
+        from uniserve.runtime.backends.matmul.gemv import Backend
+
+        provider = Backend(provider, gemv_reduction)
     quantizer = x.quantizer if isinstance(x, QuantizedTensor) else None
     configs = provider.workspace_buffers(
         weight,
@@ -51,6 +56,7 @@ def apply_linear(
     output_dtype: torch.dtype | None = None,
     out: torch.Tensor | None = None,
     operator=None,
+    gemv_reduction: GemvReduction = "default",
 ) -> torch.Tensor:
     """Compute local ``x @ weight.T + bias`` without implicit collectives.
 
@@ -58,6 +64,7 @@ def apply_linear(
     caller workspace; a standalone call prepares its own execution resources.
     Output storage, when supplied, must exactly match the result representation.
     """
+    validate_reduction(gemv_reduction)
     if x.ndim < 1 or weight.ndim != 2 or x.shape[-1] != weight.shape[-1]:
         raise ValueError(
             "linear operands must agree on their contraction dimension"
@@ -85,7 +92,7 @@ def apply_linear(
 
         operator = _binding.matmul.get().get(id(weight))
     if operator is None:
-        operator = _operator(weight, matrix, dtype)
+        operator = _operator(weight, matrix, dtype, gemv_reduction)
 
     destination = (
         result

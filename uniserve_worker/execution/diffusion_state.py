@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -13,6 +13,9 @@ from uniserve.diffusion import Branch, Guidance, Schedule
 from uniserve.model import ImageDenoiser
 from uniserve.processing import BranchSource
 from uniserve_worker.model_executor.diffusion_runner import DenoisingSteps
+
+if TYPE_CHECKING:
+    from uniserve_worker.media.camera import CameraArchive
 
 
 @dataclass(slots=True)
@@ -54,7 +57,7 @@ class SlotState:
 
     tensors: dict[str, Mapping[str, torch.Tensor]] = field(default_factory=dict)
     steps: DenoisingSteps | None = None
-    staging: Future[None] | None = None
+    staging: Future[CameraArchive | None] | None = None
 
 
 @dataclass(slots=True)

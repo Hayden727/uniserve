@@ -8,6 +8,7 @@ use fastokens::Tokenizer as FastokensTokenizer;
 use fastokens::decoders::Decoder as FastokensDecoder;
 use serde_json::{Value, json};
 use thiserror_ext::AsReport as _;
+use tokenizers::Tokenizer as HfTokenizer;
 use tracing::info;
 
 use crate::profile::tokenizer::Result;
@@ -64,24 +65,42 @@ fn decode_fastokens_byte_level(
 /// One instance is shared through `DynTokenizer` by every request of a
 /// resolved model; all methods take `&self`.
 pub struct HuggingFaceTokenizer {
-    tokenizer: Box<FastokensTokenizer>,
-    /// Whether the decoder is a single `ByteLevel` step, which routes `decode`
-    /// through `decode_fastokens_byte_level`.
-    byte_level: bool,
+    tokenizer: TokenizerBackend,
     /// IDs of added tokens flagged `special`, sorted and deduplicated for the
     /// binary search in `is_special_id`.
     special_token_ids: Arc<[u32]>,
 }
 
+/// Select by the tokenizer's numerical model, never the served model name.
+/// Unigram needs SentencePiece normalization and segmentation, which the
+/// BPE backend does not implement.
+enum TokenizerBackend {
+    Fastokens {
+        tokenizer: Box<FastokensTokenizer>,
+        /// A pure ByteLevel decoder admits the existing direct decode path.
+        byte_level: bool,
+    },
+    HuggingFace(Box<HfTokenizer>),
+}
+
 impl HuggingFaceTokenizer {
     /// Loads tokenizer data and derives special-token lookup tables.
     ///
-    /// Returns a tokenizer error when `fastokens` cannot load `path`.
+    /// Returns a tokenizer error for an unsupported tokenizer model or when
+    /// its backend cannot load `path`.
     pub fn new(path: &Path) -> Result<Self> {
         info!(path = %path.display(), "loading configured Hugging Face tokenizer");
-        let tokenizer = FastokensTokenizer::from_file(path)
-            .map_err(|error| tokenizer_error!("failed to load tokenizer: {}", error.as_report()))?;
-        Ok(Self::from_fastokens(tokenizer))
+        let definition = read_json(path)?;
+        if definition["model"]["type"].as_str() == Some("BPE") {
+            // Keep fastokens' file loading, including its adjacent config
+            // handling, unchanged for existing BPE deployments.
+            let tokenizer = FastokensTokenizer::from_file(path).map_err(|error| {
+                tokenizer_error!("failed to load tokenizer: {}", error.as_report())
+            })?;
+            Ok(Self::from_fastokens(tokenizer))
+        } else {
+            Self::from_definition(definition)
+        }
     }
 
     /// Loads a tokenizer the way `transformers` loads its directory: the
@@ -94,7 +113,7 @@ impl HuggingFaceTokenizer {
     /// it as a single token; [`register_declared_tokens`] states the rule.
     ///
     /// Returns a tokenizer error when either file cannot be read or parsed,
-    /// or when `fastokens` cannot build the extended definition.
+    /// or when the selected backend cannot build the extended definition.
     pub fn with_config(path: &Path, config: &Path) -> Result<Self> {
         info!(
             path = %path.display(),
@@ -103,9 +122,37 @@ impl HuggingFaceTokenizer {
         );
         let mut definition = read_json(path)?;
         register_declared_tokens(&mut definition, &read_json(config)?)?;
-        let tokenizer = FastokensTokenizer::from_json(definition)
-            .map_err(|error| tokenizer_error!("failed to load tokenizer: {}", error.as_report()))?;
-        Ok(Self::from_fastokens(tokenizer))
+        Self::from_definition(definition)
+    }
+
+    fn from_definition(definition: Value) -> Result<Self> {
+        match definition["model"]["type"].as_str() {
+            Some("BPE") => {
+                let tokenizer = FastokensTokenizer::from_json(definition).map_err(|error| {
+                    tokenizer_error!("failed to load tokenizer: {}", error.as_report())
+                })?;
+                Ok(Self::from_fastokens(tokenizer))
+            }
+            Some("Unigram") => {
+                let tokenizer: HfTokenizer =
+                    serde_json::from_value(definition).map_err(|error| {
+                        tokenizer_error!("failed to load tokenizer: {}", error.as_report())
+                    })?;
+                let mut special_token_ids: Vec<u32> = tokenizer
+                    .get_added_tokens_decoder()
+                    .into_iter()
+                    .filter_map(|(id, token)| token.special.then_some(id))
+                    .collect();
+                special_token_ids.sort_unstable();
+                special_token_ids.dedup();
+                Ok(Self {
+                    tokenizer: TokenizerBackend::HuggingFace(Box::new(tokenizer)),
+                    special_token_ids: Arc::from(special_token_ids),
+                })
+            }
+            Some(kind) => Err(tokenizer_error!("unsupported tokenizer model type: {kind}")),
+            None => Err(tokenizer_error!("the tokenizer model has no type")),
+        }
     }
 
     /// Derives the special-token lookup tables of a loaded tokenizer.
@@ -122,17 +169,25 @@ impl HuggingFaceTokenizer {
         let byte_level = tokenizer.decoder().is_some_and(is_byte_level_only);
 
         Self {
-            tokenizer: Box::new(tokenizer),
-            byte_level,
+            tokenizer: TokenizerBackend::Fastokens {
+                tokenizer: Box::new(tokenizer),
+                byte_level,
+            },
             special_token_ids: Arc::from(special_token_ids),
         }
     }
 
     /// Encodes one prompt string into token IDs.
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
-        self.tokenizer
-            .encode_with_special_tokens(text, add_special_tokens)
-            .map_err(|error| tokenizer_error!("encoding failed: {}", error.as_report()))
+        match &self.tokenizer {
+            TokenizerBackend::Fastokens { tokenizer, .. } => tokenizer
+                .encode_with_special_tokens(text, add_special_tokens)
+                .map_err(|error| tokenizer_error!("encoding failed: {}", error.as_report())),
+            TokenizerBackend::HuggingFace(tokenizer) => tokenizer
+                .encode(text, add_special_tokens)
+                .map(|encoding| encoding.get_ids().to_vec())
+                .map_err(|error| tokenizer_error!("encoding failed: {error}")),
+        }
     }
 
     /// Decodes token identifiers with optional special-token filtering.
@@ -140,29 +195,42 @@ impl HuggingFaceTokenizer {
     /// IDs outside the vocabulary contribute no text. A tokenizer whose
     /// decoder is a single byte-level step decodes through
     /// `decode_fastokens_byte_level`, which cannot fail. Any other tokenizer
-    /// decodes through `fastokens`, which fails only when its decoder does.
+    /// decodes through its configured backend.
     pub fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String> {
-        if self.byte_level {
-            Ok(decode_fastokens_byte_level(
-                &self.tokenizer,
+        match &self.tokenizer {
+            TokenizerBackend::Fastokens {
+                tokenizer,
+                byte_level: true,
+            } => Ok(decode_fastokens_byte_level(
+                tokenizer,
                 token_ids,
                 skip_special_tokens,
-            ))
-        } else {
-            self.tokenizer
+            )),
+            TokenizerBackend::Fastokens { tokenizer, .. } => tokenizer
                 .decode(token_ids, skip_special_tokens)
-                .map_err(|error| tokenizer_error!("decoding failed: {}", error.as_report()))
+                .map_err(|error| tokenizer_error!("decoding failed: {}", error.as_report())),
+            TokenizerBackend::HuggingFace(tokenizer) => tokenizer
+                .decode(token_ids, skip_special_tokens)
+                .map_err(|error| tokenizer_error!("decoding failed: {error}")),
         }
     }
 
     /// Resolves one vocabulary token to its identifier.
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
-        self.tokenizer.token_to_id(token)
+        match &self.tokenizer {
+            TokenizerBackend::Fastokens { tokenizer, .. } => tokenizer.token_to_id(token),
+            TokenizerBackend::HuggingFace(tokenizer) => tokenizer.token_to_id(token),
+        }
     }
 
     /// Resolves one vocabulary identifier to its token text.
     pub fn id_to_token(&self, id: u32) -> Option<String> {
-        self.tokenizer.id_to_token(id).map(ToOwned::to_owned)
+        match &self.tokenizer {
+            TokenizerBackend::Fastokens { tokenizer, .. } => {
+                tokenizer.id_to_token(id).map(ToOwned::to_owned)
+            }
+            TokenizerBackend::HuggingFace(tokenizer) => tokenizer.id_to_token(id),
+        }
     }
 
     /// Returns whether an identifier belongs to the special-token set.
@@ -395,8 +463,12 @@ fn register_declared_tokens(definition: &mut Value, config: &Value) -> Result<()
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
+    use tokenizers::decoders::fuse::Fuse;
     use tokenizers::models::bpe::BPE;
-    use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
+    use tokenizers::models::unigram::Unigram;
+    use tokenizers::normalizers::unicode::NFKC;
+    use tokenizers::processors::template::TemplateProcessing;
+    use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder, TruncationParams};
 
     use super::HuggingFaceTokenizer;
 
@@ -449,6 +521,54 @@ mod tests {
             .token_to_id("<|im_end|>")
             .expect("resolve special token");
         assert!(configured.is_special_id(special_id));
+    }
+
+    /// A SentencePiece-style tokenizer keeps its normalization, terminal EOS,
+    /// truncation and decoding when loaded through either public constructor.
+    #[test]
+    fn unigram_tokenizers_preserve_normalization_eos_and_truncation() {
+        let vocabulary = [("<unk>", 0.0), ("</s>", 0.0), ("a", -1.0), ("é", -1.0)]
+            .map(|(token, score)| (token.to_owned(), score))
+            .to_vec();
+        let mut tokenizer =
+            TokenizerBuilder::new(Unigram::from(vocabulary, Some(0), false).unwrap());
+        tokenizer.with_normalizer(Some(NFKC));
+        tokenizer.with_decoder(Some(Fuse::new()));
+        tokenizer.add_special_tokens(&[AddedToken::from("</s>", true)]);
+        tokenizer.with_post_processor(Some(
+            TemplateProcessing::builder()
+                .try_single("$A </s>")
+                .unwrap()
+                .special_tokens(vec![("</s>", 1)])
+                .build()
+                .unwrap(),
+        ));
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: 4,
+                ..Default::default()
+            }))
+            .unwrap();
+        let (directory, path) = save_tokenizer(&tokenizer);
+        let config = directory.path().join("tokenizer_config.json");
+        std::fs::write(&config, r#"{"eos_token":"</s>","pad_token":"<pad>"}"#).unwrap();
+        let plain = HuggingFaceTokenizer::new(&path).unwrap();
+        let configured = HuggingFaceTokenizer::with_config(&path, &config).unwrap();
+
+        for loaded in [&plain, &configured] {
+            assert_eq!(loaded.encode("ａe\u{301}", false).unwrap(), [2, 3]);
+            assert_eq!(loaded.encode("ａe\u{301}", true).unwrap(), [2, 3, 1]);
+            assert_eq!(loaded.encode("", true).unwrap(), [1]);
+            assert_eq!(loaded.encode("aaaaaa", true).unwrap(), [2, 2, 2, 1]);
+            assert_eq!(loaded.decode(&[2, 3, 1, 999], true).unwrap(), "aé");
+            assert_eq!(loaded.decode(&[2, 3, 1], false).unwrap(), "aé</s>");
+            assert_eq!(loaded.token_to_id("é"), Some(3));
+            assert_eq!(loaded.id_to_token(3).as_deref(), Some("é"));
+            assert!(loaded.is_special_id(1));
+            assert!(!loaded.is_special_id(2));
+        }
+        assert_eq!(configured.encode("<pad>", false).unwrap(), [4]);
+        assert!(configured.is_special_id(4));
     }
 
     const BYTE_LEVEL_TOKENIZER: &str = r#"{

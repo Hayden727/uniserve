@@ -1,7 +1,7 @@
 """Media unit encoding and artifact assembly scheduled on a host rank's lane.
 
 A host rank encodes the media units it is handed and, when it is the muxer,
-encodes the audio track and assembles the encoded tracks into the request's
+encodes any audio track and assembles the encoded tracks into the request's
 container, each as a task on the rank's lane. A unit decoded on this host is
 read in place from the shared-storage segment its producer published. This
 module owns the rank-side scheduling: which task runs for which call, on
@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     import torch
 
     from uniserve_worker.execution.host import HostTask
+    from uniserve_worker.media.camera_result import CameraResult
     from uniserve_worker.transport.shm import HostBorrow
 
 __all__ = [
@@ -159,7 +160,7 @@ def _map(source: HostBorrow) -> np.ndarray:
 
 @dataclass(slots=True)
 class MuxSession:
-    """One request epoch's container and encoded audio on the muxer rank.
+    """One request epoch's container and optional audio on the muxer rank.
 
     Lane tasks hold ``lock`` while they touch the container. A request that
     ends early is marked discarded, and the container is closed only while
@@ -175,7 +176,8 @@ class MuxSession:
 
     ``audio_scheduled`` and ``finalized`` are set by `MediaMux` when it
     schedules the corresponding task, before the task runs; ``audio`` is
-    written by the audio task under ``lock``.
+    written by the audio task under ``lock``. Video-only sessions schedule
+    no audio task and leave ``audio`` absent.
     """
 
     config: AvMuxConfig
@@ -258,9 +260,9 @@ class MediaMux:
     """Request-indexed artifact assembly on the muxer rank.
 
     The engine orders a request's assembly: it schedules the next append only
-    after the previous one completed and the final call only after the audio
-    track and every unit are in, so the rank's single lane runs them in
-    order without dependencies between its tasks.
+    after the previous one completed and the final call only after every
+    unit and any configured audio track are in, so the rank's single lane
+    runs them in order without dependencies between its tasks.
     """
 
     def __init__(self, *, rank: int) -> None:
@@ -295,10 +297,12 @@ class MediaMux:
         because only the assembled artifact is this request's output.
 
         Raises:
-            WorkerError: When the request has no session, its audio is
-                already scheduled, or its artifact is already finalized.
+            WorkerError: When the request has no session or audio track, its
+                audio is already scheduled, or its artifact is finalized.
         """
         session = self._session(request_key)
+        if session.config.audio_rate == 0:
+            raise invalid_descriptor("video-only media has no audio track")
         if session.finalized or session.audio_scheduled:
             raise invalid_descriptor("audio output is already written")
         session.audio_scheduled = True
@@ -359,37 +363,47 @@ class MediaMux:
         request_key: RequestKey,
         reservation: HostTask,
         call_id: CallId,
+        *,
+        camera: CameraResult | None = None,
     ) -> HostTask:
-        """Schedule the artifact's assembly after every unit and the audio.
+        """Schedule assembly after every unit and any configured audio.
 
-        The task muxes the audio track, publishes the MP4 to shared storage,
-        and results in the artifact's handle. Scheduling checks only that the
-        audio encode was scheduled; the task itself fails, for example, when
-        the encoded audio is missing or `AvMuxSession.finalize` finds a unit
-        missing.
+        The task muxes any audio track and results in the published MP4
+        handle. Camera bundles return bytes instead: the output materializer
+        publishes them only when delivering a completed result, so abandoning
+        an in-flight export cannot leave unclaimed shared storage. For audio,
+        scheduling checks that the encode was scheduled; the task itself
+        fails when its encoded audio is missing. `AvMuxSession.finalize`
+        checks that every video unit is present in either case.
 
         Raises:
             WorkerError: When the request has no session, its artifact is
-                already finalized, or its audio encode was never scheduled.
+                finalized, or its configured audio encode was never scheduled.
         """
         session = self._session(request_key)
         if session.finalized:
             raise invalid_descriptor(
                 "media finalization requires an open assembly session"
             )
-        if not session.audio_scheduled:
+        if session.config.audio_rate > 0 and not session.audio_scheduled:
             raise invalid_descriptor(
                 "artifact finalization precedes the audio track's encode"
             )
         session.finalized = True
 
-        def finalize() -> MediaOutput:
+        def finalize() -> MediaOutput | bytes:
             with session.held() as container:
-                if session.audio is None:
+                if session.config.audio_rate > 0 and session.audio is None:
                     raise invalid_descriptor(
                         "artifact assembly has no encoded audio"
                     )
                 payload = container.finalize(session.audio)
+            if camera is not None:
+                from uniserve_worker.media.camera_result import (
+                    dump_camera_result,
+                )
+
+                return dump_camera_result(camera, video=payload)
             return MediaOutput(
                 handle=PosixShmArtifact(name=publish_media_bytes(payload)),
                 bytes=len(payload),

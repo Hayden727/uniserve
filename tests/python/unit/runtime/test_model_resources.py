@@ -265,11 +265,11 @@ def test_result_publication_rejects_unrepresentable_numerical_outputs(
     dtype, axes, message
 ):
     from tests.python.fixtures.encoding import Model as EncodedModel
-    from uniserve.model import TextEncoder
+    from uniserve.model import DecoderTextEncoder
     from uniserve.tensors import OutputLayout
     from uniserve_worker.bootstrap.outputs import resolve_outputs
 
-    class FeatureEncoder(TextEncoder):
+    class FeatureEncoder(DecoderTextEncoder):
         def output_layout(self, num_tokens, _deployment_dtype):
             return {
                 "conditioning": OutputLayout(

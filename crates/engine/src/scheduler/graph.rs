@@ -75,6 +75,8 @@ pub(crate) struct VideoGraph {
     condition_units: Vec<u32>,
     /// Whether any condition carries an audio track to encode.
     condition_audio: bool,
+    /// The final artifact consumes native camera latents as well as optional video.
+    camera_output: bool,
 }
 
 /// The media calls every video request runs, whatever its task.
@@ -89,13 +91,20 @@ const GENERATION_CALLS: [MediaCall; 8] = [
     MediaCall::Muxing,
 ];
 
+fn generation_calls(task: VideoTask) -> impl Iterator<Item = MediaCall> {
+    GENERATION_CALLS.into_iter().filter(move |call| {
+        task.generates_audio()
+            || !matches!(call, MediaCall::AudioDecoding | MediaCall::AudioEncoding)
+    })
+}
+
 /// The media calls a request of `task` runs: the generation calls, and for a
 /// conditioned task the calls reading and encoding its conditions. Every
 /// keyframe and every `ref2va` request presents vision blocks, so a
 /// conditioned task always encodes vision.
 pub(crate) fn task_calls(task: VideoTask) -> Vec<MediaCall> {
     let conditions: &[MediaCall] = match task {
-        VideoTask::T2va => &[],
+        VideoTask::T2va | VideoTask::Camera2v => &[],
         VideoTask::Fl2va | VideoTask::Ref2va => &[
             MediaCall::MediaReading,
             MediaCall::VisionEncoding,
@@ -104,8 +113,8 @@ pub(crate) fn task_calls(task: VideoTask) -> Vec<MediaCall> {
     };
     conditions
         .iter()
-        .chain(GENERATION_CALLS.iter())
         .copied()
+        .chain(generation_calls(task))
         .collect()
 }
 
@@ -149,7 +158,7 @@ impl VideoGraph {
         let mut produce = |call: MediaCall, name: &'static str, extent: Option<u32>| {
             products.push(GraphProduct { call, name, extent });
         };
-        if request.task != VideoTask::T2va {
+        if request.task.has_media_conditions() {
             calls.push(MediaCall::MediaReading);
             if pixels > 0 {
                 produce(
@@ -194,7 +203,13 @@ impl VideoGraph {
                 );
             }
         }
-        calls.extend(GENERATION_CALLS);
+        let include_video = request
+            .camera
+            .as_ref()
+            .is_none_or(|camera| camera.include_video);
+        calls.extend(generation_calls(request.task).filter(|call| {
+            include_video || !matches!(call, MediaCall::VideoDecoding | MediaCall::VideoEncoding)
+        }));
         produce(
             MediaCall::TextEncoding,
             product::CONDITIONING,
@@ -204,18 +219,24 @@ impl VideoGraph {
             )?),
         );
         produce(MediaCall::Denoising, product::VIDEO_LATENTS, None);
-        produce(MediaCall::Denoising, product::AUDIO_LATENTS, None);
-        produce(
-            MediaCall::VideoDecoding,
-            product::VIDEO_UNITS,
-            Some(request.sampling.video_units),
-        );
-        produce(
-            MediaCall::VideoEncoding,
-            product::ENCODED_UNITS,
-            Some(request.sampling.video_units),
-        );
-        produce(MediaCall::AudioDecoding, product::AUDIO_SAMPLES, None);
+        if request.task.generates_audio() {
+            produce(MediaCall::Denoising, product::AUDIO_LATENTS, None);
+        }
+        if include_video {
+            produce(
+                MediaCall::VideoDecoding,
+                product::VIDEO_UNITS,
+                Some(request.sampling.video_units),
+            );
+            produce(
+                MediaCall::VideoEncoding,
+                product::ENCODED_UNITS,
+                Some(request.sampling.video_units),
+            );
+        }
+        if request.task.generates_audio() {
+            produce(MediaCall::AudioDecoding, product::AUDIO_SAMPLES, None);
+        }
 
         Ok(Self {
             calls,
@@ -229,6 +250,7 @@ impl VideoGraph {
                 .flat_map(|condition| condition.latent_units.iter().copied())
                 .collect(),
             condition_audio: audio_rows > 0,
+            camera_output: request.camera.is_some(),
         })
     }
 
@@ -248,11 +270,16 @@ impl VideoGraph {
         if !self.runs(call) {
             return Vec::new();
         }
-        call.readers()
+        let mut readers: Vec<_> = call
+            .readers()
             .iter()
             .copied()
             .filter(|reader| self.runs(*reader))
-            .collect()
+            .collect();
+        if self.camera_output && call == MediaCall::Denoising {
+            readers.push(MediaCall::Muxing);
+        }
+        readers
     }
 
     /// Every product the request reserves at admission.
@@ -295,6 +322,53 @@ impl VideoGraph {
 mod tests {
     use std::sync::Arc;
 
+    #[test]
+    fn camera_video_graph_omits_audio_products_and_dependencies() {
+        let graph =
+            super::VideoGraph::new(&request(super::VideoTask::Camera2v, Vec::new())).unwrap();
+        assert!(!graph.runs(super::MediaCall::AudioDecoding));
+        assert!(!graph.runs(super::MediaCall::AudioEncoding));
+        assert!(graph.runs(super::MediaCall::Muxing));
+        assert!(graph.product(super::product::AUDIO_LATENTS).is_none());
+        assert!(graph.product(super::product::AUDIO_SAMPLES).is_none());
+        assert!(graph.product(super::product::VIDEO_LATENTS).is_some());
+    }
+
+    #[test]
+    fn camera_results_keep_native_latents_and_only_decode_requested_previews() {
+        for include_video in [false, true] {
+            let mut request = request(VideoTask::Camera2v, Vec::new());
+            request.camera = Some(Box::new(uniserve_core::CameraInput {
+                source: uniserve_core::MediaLocator {
+                    name: "camera".into(),
+                    bytes: 4096,
+                },
+                grid: uniserve_core::CameraGrid {
+                    views: 12,
+                    columns: 4,
+                    order: uniserve_core::CameraOrder::ViewMajor,
+                },
+                clean_cells: vec![0],
+                include_video,
+            }));
+            let graph = VideoGraph::new(&request).unwrap();
+            assert_eq!(graph.runs(MediaCall::VideoDecoding), include_video);
+            assert_eq!(graph.runs(MediaCall::VideoEncoding), include_video);
+            assert_eq!(graph.product(product::VIDEO_UNITS).is_some(), include_video);
+            assert_eq!(
+                graph.product(product::ENCODED_UNITS).is_some(),
+                include_video
+            );
+            assert!(graph.product(product::VIDEO_LATENTS).is_some());
+            assert!(
+                graph
+                    .consumers(MediaCall::Denoising)
+                    .contains(&MediaCall::Muxing)
+            );
+            assert!(!graph.runs(MediaCall::AudioDecoding));
+        }
+    }
+
     use uniserve_core::{
         AudioClip, Canvas, ConditionMedia, ConditionRole, ConditionVision, DiffusionSamplingParams,
         ImageFit, MediaSource, RequestId, VideoClip, VideoCondition, VisionGrid,
@@ -304,6 +378,8 @@ mod tests {
 
     fn request(task: VideoTask, conditions: Vec<VideoCondition>) -> DiffusionRequest {
         DiffusionRequest {
+            camera: None,
+            camera_media: None,
             request_id: RequestId(1),
             task,
             prompt_token_ids: vec![1; 40],

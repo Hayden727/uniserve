@@ -586,6 +586,9 @@ def test_a_media_worker_keeps_a_request_slot_for_every_three_queue_positions():
     with torch.device("meta"):
         model = Model(base_config())
     config = cpu_worker_config(
+        attention_backend="torch_fused",
+        matmul_backend="torch",
+        grid_attention_backend="flash_attn_4_sm100",
         max_model_len=4096,
         max_video_seconds=5.0,
         max_batch_calls=8,
@@ -599,6 +602,9 @@ def test_a_media_worker_keeps_a_request_slot_for_every_three_queue_positions():
         resolved = loaded_worker_config(model, config, queue_depth)
         assert resolved.max_request_pool_size == slots
         assert resolved.max_batch_calls == slots
+        assert resolved.attention_backend == "torch_fused"
+        assert resolved.matmul_backend == "torch"
+        assert resolved.grid_attention_backend == "flash_attn_4_sm100"
     # Fewer than three positions cannot pipeline one request.
     with pytest.raises(WorkerError):
         loaded_worker_config(model, config, 2)

@@ -682,6 +682,54 @@ def test_text_entry_stages_successive_bounded_inputs(device):
         runner.close()
 
 
+@torch.inference_mode()
+def test_bidirectional_text_entry_keeps_actual_lengths_with_video_capacities():
+    from tests.python.fixtures.h3 import fasth3_config
+    from uniserve_models.minimax_h3 import Model as H3Model
+    from uniserve_models.wan.text import Encoder, TextConfig
+    from uniserve_worker.model_executor.media_inputs import MediaBuilder
+
+    torch.manual_seed(19)
+    model = EncodedModel()
+    model.text_encoder = Encoder(
+        TextConfig(
+            vocab_size=32,
+            hidden_size=16,
+            head_dim=8,
+            num_heads=2,
+            ffn_dim=24,
+            num_layers=1,
+        )
+    )
+    runner = ModelExecutor(
+        model,
+        cpu_worker_config(max_model_len=16, model_dtype="float32"),
+        bindings=_encoder_bindings(
+            model, (("text_encoder", ComponentConfig((0,))),)
+        ),
+    )
+    with torch.device("meta"):
+        denoiser = H3Model(fasth3_config()).transformer
+    # A real video capacity planner rounds text to complete 64-row tiles.
+    # Those capacities govern storage, but cannot add tokens to UMT5 attention.
+    runner.media_builder = MediaBuilder(
+        denoiser, max_frames=22, max_text_tokens=16
+    )
+    assert runner._text_capacity(3) == 64
+    try:
+        for prompt in ((2, 5, 9), (7,), (2, 5, 9)):
+            expected = model.text_encoder.encode((torch.tensor(prompt),))[0]
+            actual = runner.encode_text(prompt).values[0]
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        padded = model.text_encoder.encode(
+            (torch.tensor((2, 5, 9) + (0,) * 61),)
+        )[0][:3]
+        assert not torch.allclose(padded, expected)
+    finally:
+        runner.synchronize()
+        runner.close()
+
+
 def test_worker_reports_text_bounds_and_executes_dense_attention_without_kv():
     model = EncodedModel()
     components = tuple(

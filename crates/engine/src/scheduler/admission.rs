@@ -633,6 +633,7 @@ impl Scheduler {
                     task: submission.request.task,
                     text_tags: submission.request.text_tags.clone(),
                     conditions: submission.request.conditions.clone(),
+                    camera: submission.request.camera.as_deref().cloned(),
                 },
             ) {
                 Ok(admission) => admission,

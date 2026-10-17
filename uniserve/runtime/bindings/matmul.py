@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from uniserve.nn.linear import MergedColumnParallelLinear
+from uniserve.nn.linear import Linear, MergedColumnParallelLinear
+from uniserve.nn.nvfp4 import NVFP4Linear
+from uniserve.nn.nvfp4_qat import NVFP4QATLinear
 from uniserve.quantization import QuantizedTensor
 
 from ..backends import matmul as matmul_backend
@@ -47,7 +49,27 @@ class MatmulBinding:
             "max_rows": rows,
             "output_dtype": output_dtype,
         }
-        provider = matmul_backend.resolve(self.backend, self._weight())
+        if isinstance(self.module, NVFP4QATLinear):
+            from ..backends.matmul.nvfp4_qat import Backend
+
+            provider = Backend(global_scale=self.module.global_scale)
+        elif isinstance(self.module, NVFP4Linear):
+            # This layer declares a numerical quantization/epilogue recipe,
+            # independently of the execution policy for ordinary dense GEMMs.
+            from ..backends.matmul.nvfp4 import Backend
+
+            provider = Backend(
+                alpha=self.module.alpha, epilogue=self.module.epilogue
+            )
+        else:
+            provider = matmul_backend.resolve(self.backend, self._weight())
+            if (
+                isinstance(self.module, Linear)
+                and self.module.gemv_reduction != "default"
+            ):
+                from ..backends.matmul.gemv import Backend
+
+                provider = Backend(provider, self.module.gemv_reduction)
         if isinstance(self.module, MergedColumnParallelLinear):
             weights = {
                 name: child.weight

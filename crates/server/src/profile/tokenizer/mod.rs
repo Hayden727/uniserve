@@ -2,6 +2,7 @@
 //! Tokenizer abstraction, Hugging Face implementation, and incremental decoding.
 //!
 //! `HuggingFaceTokenizer` loads a model's `tokenizer.json` through `fastokens`
+//! for BPE or Hugging Face `tokenizers` for Unigram
 //! (with `HuggingFaceTokenizer::with_config`, as a diffusers pipeline's
 //! tokenizer component is loaded, also the special tokens its
 //! `tokenizer_config.json` declares) and serves both directions of the text

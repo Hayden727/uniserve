@@ -18,6 +18,7 @@ import torch
 from uniserve.diffusion import Schedule, normal_noise
 from uniserve.media import image, video
 from uniserve.model import Condition, LatentInput, VideoDenoiser
+from uniserve.model.camera import CameraDenoiser, CameraGrid
 from uniserve.tensors import BufferConfig
 
 #: Pages one request's samples span in the latent pool. Every denoising step
@@ -127,9 +128,10 @@ class MediaBuilder:
     smallest text capacity with the request's own condition region, which
     its runner prepares on first use and steps without a graph.
     ``maximum_layout`` bounds every such layout: the largest text-only
-    layout widened to the worker's condition capacity. A denoiser that is
-    not ``text_only`` receives only such requests, so ``layouts`` is empty
-    for it and startup prepares the maximum alone.
+    layout widened to the worker's condition capacity. CameraDenoiser instead
+    declares fixed camera fields through ``camera_buffers``: changing their
+    values does not change the layout, so these requests share prepared
+    layouts and captured steps as well.
 
     The samples a solver step rewrites live in the worker's latent pool (see
     ``sample_pages``); the request's slot holds only state written once: the
@@ -235,7 +237,9 @@ class MediaBuilder:
                     min(
                         largest,
                         denoiser.layout_size(
-                            self._size(frames, value, reference)
+                            self._size(
+                                frames, min(value, max_text_tokens), reference
+                            )
                         ).num_text_tokens,
                     )
                     for value in (*below, max_text_tokens)
@@ -263,7 +267,19 @@ class MediaBuilder:
         *,
         conditions: tuple[Condition, ...] = (),
         vision_spans: tuple[tuple[int, int], ...] = (),
+        camera_grid: CameraGrid | None = None,
     ):
+        if camera_grid is not None:
+            if not isinstance(self.denoiser, CameraDenoiser):
+                raise ValueError("camera grid requires a camera denoiser")
+            return self.denoiser.make_camera_size(
+                camera_grid,
+                num_frames,
+                num_text_tokens,
+                canvas=canvas,
+                conditions=conditions,
+                vision_spans=vision_spans,
+            )
         return self.denoiser.make_size(
             num_frames,
             num_text_tokens,
@@ -280,6 +296,7 @@ class MediaBuilder:
         *,
         conditions: tuple[Condition, ...] = (),
         vision_spans: tuple[tuple[int, int], ...] = (),
+        camera_grid: CameraGrid | None = None,
     ):
         """Return the denoiser's exact size for an admitted request.
 
@@ -298,6 +315,7 @@ class MediaBuilder:
             canvas,
             conditions=conditions,
             vision_spans=vision_spans,
+            camera_grid=camera_grid,
         )
         if (
             size.num_frames not in self.frame_counts
@@ -347,6 +365,11 @@ class MediaBuilder:
             or size.canvas not in self.canvases
         ):
             raise ValueError("media input has no admitted capacity layout")
+        if isinstance(self.denoiser, CameraDenoiser):
+            # The numerical capability states whether prompt lengths share a
+            # padded feature layout. The text encoder's token length remains
+            # independent from the denoiser's numerical context shape.
+            return self.denoiser.layout_size(size)
         for capacity in self.text_capacities:
             layout = self.denoiser.layout_size(
                 self._size(
@@ -361,17 +384,20 @@ class MediaBuilder:
         raise ValueError("media input has no admitted capacity layout")
 
     def layouts(self) -> tuple:
-        """List every text-only capacity layout, the largest first.
+        """List every reusable capacity layout, the largest first.
 
         These are the layouts startup prepares and captures. The first is
         the largest; ``maximum_layout`` bounds it and every other layout's
         row-shaped workspace dimension by dimension. Layouts start at the
         maximum's canvas and follow the other canvases in decreasing
         generated rows, then frame counts and text capacities in decreasing
-        order. There are none when the denoiser is not ``text_only``: no
-        request it admits evaluates in one.
+        order. Camera fields have declared bounded shapes and remain live
+        request state. Other condition regions may change shapes and retain
+        their individual layouts prepared when a request arrives.
         """
-        if not self.denoiser.text_only:
+        if not self.denoiser.text_only and not isinstance(
+            self.denoiser, CameraDenoiser
+        ):
             return ()
 
         canvases = sorted(
@@ -547,6 +573,20 @@ class MediaBuilder:
             ),
             torch.bfloat16,
         )
+        if isinstance(self.denoiser, CameraDenoiser):
+            count = sum(
+                math.prod(shape)
+                for shape in self.denoiser.sampling_noise_shapes(layout)
+            )
+            result["sampling_noise_draws"] = BufferConfig(
+                (count,), torch.float32, host=True
+            )
+            result["sampling_noise_source"] = BufferConfig(
+                (count,), self.denoiser.prediction_dtype, host=True
+            )
+            result["sampling_noise"] = BufferConfig(
+                (count,), self.denoiser.prediction_dtype
+            )
         return result
 
     def capacity_buffers(self) -> Mapping[str, BufferConfig]:
@@ -594,6 +634,18 @@ class MediaBuilder:
             offset += count
         return tuple(views)
 
+    def sampling_noise(self, size, tensors, *, host=False):
+        """Borrow each independent sampler draw in its complete native shape."""
+        if not isinstance(self.denoiser, CameraDenoiser):
+            return ()
+        flat = tensors["sampling_noise_draws" if host else "sampling_noise"]
+        views, offset = [], 0
+        for shape in self.denoiser.sampling_noise_shapes(size):
+            count = math.prod(shape)
+            views.append(flat[offset : offset + count].view(shape))
+            offset += count
+        return tuple(views)
+
     @torch.inference_mode()
     def stage_request(
         self,
@@ -602,7 +654,8 @@ class MediaBuilder:
         *,
         seed: int,
         layout=None,
-    ) -> None:
+        camera=None,
+    ):
         """Fill a request's host inputs that its admission determines.
 
         The seeded native draw and the request's own state tables depend only
@@ -622,6 +675,10 @@ class MediaBuilder:
                     tensors[f"{name}_noise"].unsqueeze(0)
                     for name in self.denoiser.modalities
                 ),
+                *(
+                    value.unsqueeze(0)
+                    for value in self.sampling_noise(size, tensors, host=True)
+                ),
             ),
         )
         self.denoiser.prepare_state(
@@ -632,6 +689,11 @@ class MediaBuilder:
                 for name in self._layout_tables(layout)
             },
         )
+        if camera is not None:
+            from uniserve_worker.execution.camera import stage_camera
+
+            return stage_camera(self, size, tensors, camera)
+        return None
 
     @torch.inference_mode()
     def initialize(
@@ -664,11 +726,23 @@ class MediaBuilder:
             constants=constants,
             workspace=workspace,
         )
+        if isinstance(self.denoiser, CameraDenoiser):
+            # Native sampling rounds each CPU FP32 draw before device copy.
+            # Keep that rounded source in the request's retained host storage
+            # so asynchronous preparation never borrows a temporary tensor.
+            tensors["sampling_noise_source"].copy_(
+                tensors["sampling_noise_draws"]
+            )
         return (
             *((samples[name], tensors[f"{name}_source"]) for name in names),
             *(
                 (tensors[name], tensors[f"{name}_source"])
                 for name in self._layout_tables(layout)
+            ),
+            *(
+                ((tensors["sampling_noise"], tensors["sampling_noise_source"]),)
+                if isinstance(self.denoiser, CameraDenoiser)
+                else ()
             ),
         )
 
@@ -728,15 +802,27 @@ class MediaBuilder:
         # Every modality's schedule enumerates the same evaluations; the
         # first names the step as device data (``Schedule.step``).
         names = self.denoiser.modalities
+        latents = {
+            name: (
+                LatentInput(samples[name], schedules[name].timesteps[index]),
+            )
+            for name in names
+        }
+        if isinstance(self.denoiser, CameraDenoiser):
+            draws = self.sampling_noise(size, tensors)
+            # The terminal zero-sigma solver returns x0; borrowing the last
+            # draw there consumes no extra RNG. Views are per-step inputs,
+            # so graph replay stages the selected independent draw.
+            return self.denoiser.bind_camera_inputs(
+                latents=latents,
+                sizes=(self.layout(size) if layout is None else layout,),
+                step=schedules[names[0]].step(index),
+                text_features=(tensors["text_condition"],),
+                state=tensors,
+                noise=(draws[min(index, len(draws) - 1)],),
+            )
         return self.denoiser.bind_inputs(
-            latents={
-                name: (
-                    LatentInput(
-                        samples[name], schedules[name].timesteps[index]
-                    ),
-                )
-                for name in names
-            },
+            latents=latents,
             sizes=(self.layout(size) if layout is None else layout,),
             step=schedules[names[0]].step(index),
             text_features=(tensors["text_condition"],),

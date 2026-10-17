@@ -2937,6 +2937,7 @@ dependencies = [
 flash-attn-4 = [
     { name = "flash-attn-4", extra = ["cu13"] },
     { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
+    { name = "quack-kernels" },
 ]
 megamoe = [
     { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
@@ -2949,6 +2950,7 @@ requires-dist = [
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'flash-attn-4'", specifier = "==4.6.2" },
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'megamoe'", specifier = "==4.6.2" },
     { name = "nvshmem4py-cu13", marker = "extra == 'megamoe'", specifier = "==0.4.0" },
+    { name = "quack-kernels", marker = "extra == 'flash-attn-4'", specifier = "==0.6.4" },
     { name = "torch", specifier = ">=2.13,<2.14" },
 ]
 provides-extras = ["flash-attn-4", "megamoe"]

@@ -465,10 +465,12 @@ fn video_admission_from_table(table: fbs::VideoAdmission<'_>) -> CodecResult<Vid
         fbs::VideoTask::T2va => VideoTask::T2va,
         fbs::VideoTask::Fl2va => VideoTask::Fl2va,
         fbs::VideoTask::Ref2va => VideoTask::Ref2va,
+        fbs::VideoTask::Camera2v => VideoTask::Camera2v,
         other => codec_bail!("unknown video task {}", other.0),
     };
     Ok(VideoAdmission {
         task,
+        camera: table.camera().map(camera_input_from_table).transpose()?,
         text_tags: table
             .text_tags()
             .map(|tags| tags.iter().collect())
@@ -478,6 +480,34 @@ fn video_admission_from_table(table: fbs::VideoAdmission<'_>) -> CodecResult<Vid
             .map(|conditions| conditions.iter().map(video_condition_from_table).collect())
             .transpose()?
             .unwrap_or_default(),
+    })
+}
+
+fn camera_input_from_table(table: fbs::CameraInput<'_>) -> CodecResult<uniserve_core::CameraInput> {
+    let order = camera_order_from_fb(table.order())?;
+    Ok(uniserve_core::CameraInput {
+        source: uniserve_core::MediaLocator {
+            name: table.source_name().unwrap_or_default().to_owned(),
+            bytes: table.source_bytes(),
+        },
+        grid: uniserve_core::CameraGrid {
+            views: table.views(),
+            columns: table.columns(),
+            order,
+        },
+        clean_cells: table
+            .clean_cells()
+            .map(|values| values.iter().collect())
+            .unwrap_or_default(),
+        include_video: table.include_video(),
+    })
+}
+
+fn camera_order_from_fb(order: fbs::CameraOrder) -> CodecResult<uniserve_core::CameraOrder> {
+    Ok(match order {
+        fbs::CameraOrder::ViewMajor => uniserve_core::CameraOrder::ViewMajor,
+        fbs::CameraOrder::TimeMajor => uniserve_core::CameraOrder::TimeMajor,
+        other => codec_bail!("unknown camera order {}", other.0),
     })
 }
 
@@ -582,8 +612,10 @@ fn generation_params_from_table(
 }
 
 /// Decodes a video denoiser's declaration; `WorkerInfo::validate` checks it.
-fn video_denoiser_from_table(table: fbs::VideoDenoiserInfo<'_>) -> crate::VideoDenoiserInfo {
-    crate::VideoDenoiserInfo {
+fn video_denoiser_from_table(
+    table: fbs::VideoDenoiserInfo<'_>,
+) -> CodecResult<crate::VideoDenoiserInfo> {
+    Ok(crate::VideoDenoiserInfo {
         tasks: table
             .tasks()
             .map(|tasks| tasks.iter().map(str::to_owned).collect())
@@ -599,6 +631,18 @@ fn video_denoiser_from_table(table: fbs::VideoDenoiserInfo<'_>) -> crate::VideoD
             clip_latent_frames: table.frames().clip_latent_frames(),
             tail_latent_frames: table.frames().tail_latent_frames(),
         },
+        camera_layout: table
+            .camera_layout()
+            .map(|layout| -> CodecResult<_> {
+                Ok(crate::CameraLayout {
+                    views: layout.views(),
+                    columns: layout.columns(),
+                    order: camera_order_from_fb(layout.order())?,
+                    frames_per_view: layout.frames_per_view(),
+                    latent_frames_per_view: layout.latent_frames_per_view(),
+                })
+            })
+            .transpose()?,
         canvases: table
             .canvases()
             .map(|canvases| {
@@ -624,7 +668,7 @@ fn video_denoiser_from_table(table: fbs::VideoDenoiserInfo<'_>) -> crate::VideoD
                 total: limits.total(),
             })
             .unwrap_or_default(),
-    }
+    })
 }
 
 /// Decodes diffusion admission parameters; `NewRequest::validate` checks the
@@ -1209,7 +1253,10 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             }
             components
         },
-        video_denoiser: info.video_denoiser().map(video_denoiser_from_table),
+        video_denoiser: info
+            .video_denoiser()
+            .map(video_denoiser_from_table)
+            .transpose()?,
         image_warmups: info
             .image_warmups()
             .map(|shapes| {

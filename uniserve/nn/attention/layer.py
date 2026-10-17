@@ -36,6 +36,11 @@ class Attention(nn.Module):
     queries read the fixed prefix interval ``[max(P - window, 0), P)`` of
     their prefix length ``P`` together with their declared current keys,
     which the window does not bound.
+
+    ``replicated_kv`` declares cross-attention whose complete conditioning
+    keys and values are present on each token rank. Query rows stay local;
+    only tensor-parallel heads are partitioned. Ulysses and context exchange
+    do not apply to this layer's conditioning token domain.
     """
 
     # Recorded by parallelize_ once the layer is bound to its partition.
@@ -51,6 +56,7 @@ class Attention(nn.Module):
         scale: float | None = None,
         cache_name: str | None = None,
         window: int | None = None,
+        replicated_kv: bool = False,
     ):
         super().__init__()
         if (
@@ -76,6 +82,16 @@ class Attention(nn.Module):
         ):
             raise ValueError("cache names must identify a numerical layer path")
         self.cache_name = cache_name
+        # Cross-attention can consume complete conditioning K/V on every
+        # token rank while its query rows remain local. Those projections
+        # must not participate in self-attention's Ulysses/context exchange.
+        if type(replicated_kv) is not bool:
+            raise TypeError("replicated_kv must be a boolean")
+        if replicated_kv and cache_name is not None:
+            raise ValueError(
+                "replicated conditioning K/V cannot use a token cache"
+            )
+        self.replicated_kv = replicated_kv
         self.local_heads = num_heads
         self.local_kv_heads = num_kv_heads
         self.head_indices = tuple(range(num_kv_heads))

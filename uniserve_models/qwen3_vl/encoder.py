@@ -118,7 +118,7 @@ class Encoder(MultimodalEncoder):
     """Encode prompts whose placeholders carry Qwen3-VL vision tokens.
 
     ``network`` is the Qwen3-VL language model and ``retained_layers`` the
-    decoder layers this encoder runs (``uniserve.model.TextEncoder``).
+    decoder layers this encoder runs (``uniserve.model.DecoderTextEncoder``).
     ``vision`` (``VisionEncoder``) encodes packed tubelet rows with their
     ``(time, height, width)`` grids into rows of ``vision.feature_size``
     values of ``dtype``: each token's embedding followed by one DeepStack

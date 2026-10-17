@@ -907,6 +907,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
             height: 768,
         },
         uniserve_worker_ipc::VideoAdmission {
+            camera: None,
             task: uniserve_core::VideoTask::T2va,
             text_tags: vec![1],
             conditions: Vec::new(),
@@ -1678,6 +1679,8 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
             let request_id = RequestId(10_000 + index as u64);
             let prompt_token_ids = vec![100_000 + index as u32];
             let events = engine.submit(Request::Diffusion(DiffusionRequest {
+                camera: None,
+                camera_media: None,
                 request_id,
                 task: uniserve_core::VideoTask::T2va,
                 text_tags: vec![1; prompt_token_ids.len()],
@@ -3062,6 +3065,11 @@ fn stub_launch_descriptor(registration: &str) -> serde_json::Value {
     "mem_fraction_static": 0.7,
     "max_total_tokens": 4096,
     "attention_backend": "torch",
+    "grid_attention_backend": "auto",
+    "matmul_backend": "auto",
+    "attention_overrides": {},
+    "convolution_plans": {},
+        "blas_workspace_size": null,
     "block_size": 16,
     "max_batch_calls": 8,
     "max_batch_tokens": 256,

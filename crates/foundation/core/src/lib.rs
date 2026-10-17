@@ -18,9 +18,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+mod camera;
 /// Serializable statistics and observer-facing wire values.
 pub mod codec;
 mod events;
+pub use camera::{CameraGrid, CameraInput, CameraOrder};
 /// The head-launcher messages and handing a bound socket to a rank process at
 /// its launch.
 pub mod launch;

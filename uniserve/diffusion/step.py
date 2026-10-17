@@ -74,12 +74,17 @@ def advance_(
             if prediction is None:
                 continue
             sample = latent.tensor
+            solver_inputs = latent.solver_inputs
             if isinstance(prediction, TensorOutput):
                 # A caller may provide the complete sample or borrow precisely
                 # its local numerical shard. The output layout distinguishes
                 # it.
                 if tuple(sample.shape) == prediction.layout.shape:
                     sample = sample[prediction.layout.local_slice]
+                    if solver_inputs is not None:
+                        solver_inputs = solver_inputs.shard(
+                            prediction.layout.local_slice
+                        )
                 prediction = prediction.tensor
             if sample.shape != prediction.shape:
                 raise ValueError(
@@ -93,6 +98,11 @@ def advance_(
                 next_timestep,
                 sigma=sigma,
                 next_sigma=next_sigma,
+                **(
+                    {"inputs": solver_inputs}
+                    if solver_inputs is not None
+                    else {}
+                ),
             )
     return samples
 

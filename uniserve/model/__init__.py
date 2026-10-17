@@ -15,6 +15,7 @@ from .denoiser import (
     VideoSize,
 )
 from .encoder import (
+    DecoderTextEncoder,
     Encoder,
     MultimodalEncoder,
     PatchEncoder,
@@ -45,6 +46,7 @@ from .transformer import PhasedLayer, TransformerDecoder, TransformerEncoder
 from .video import (
     AudioDecoder,
     AudioEncoder,
+    OverlapPostprocessor,
     VideoDecoder,
     VideoEncoder,
     VideoPostprocessor,
@@ -84,10 +86,12 @@ __all__ = [
     "VideoDecoder",
     "VideoEncoder",
     "VideoPostprocessor",
+    "OverlapPostprocessor",
     "Encoder",
     "MultimodalEncoder",
     "PatchEncoder",
     "TextConditioner",
     "TextEncoder",
+    "DecoderTextEncoder",
     "TubeletEncoder",
 ]

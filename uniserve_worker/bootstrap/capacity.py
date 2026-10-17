@@ -37,6 +37,7 @@ from uniserve.model import (
     VideoDecoder,
     VideoPostprocessor,
 )
+from uniserve.model.camera import CameraDenoiser
 from uniserve.processing import (
     FeatureLayout,
     ImageProcessor,
@@ -310,6 +311,7 @@ def local_product_storage_bytes(
     *,
     bindings: Mapping[str, ComponentBinding],
     media_components: Mapping[MediaCall, str],
+    camera_outputs: bool = False,
 ) -> int:
     """Size the persistent products this rank backs, from its placement.
 
@@ -340,6 +342,11 @@ def local_product_storage_bytes(
     for source_call, destination_call in _ipc.product_edges():
         source = media_components.get(MediaCall(source_call))
         destination = media_components.get(MediaCall(destination_call))
+        if source is not None and destination is not None:
+            consumers.setdefault(source, set()).add(destination)
+    if camera_outputs:
+        source = media_components.get(MediaCall.DENOISING)
+        destination = media_components.get(MediaCall.MUXING)
         if source is not None and destination is not None:
             consumers.setdefault(source, set()).add(destination)
 
@@ -655,6 +662,7 @@ def model_arena_capacity(
                 media_components=media_components(
                     model, worker_config.deployment_components
                 ),
+                camera_outputs=capability(model, CameraDenoiser) is not None,
             ),
             concurrent_imports=artifact_import_regions(
                 model, worker_config, bindings=bindings or {}
@@ -889,6 +897,8 @@ def resolve_request_capacity(
                     media_components=media_components(
                         model, worker_config.deployment_components
                     ),
+                    camera_outputs=capability(model, CameraDenoiser)
+                    is not None,
                 )
                 arena = request_tensor_arena_capacity(
                     capacity_config,

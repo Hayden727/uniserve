@@ -3,11 +3,126 @@
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from uniserve.nn.attention import Attention, AttentionBatch, DenseInput
 from uniserve.runtime import CUDAGraph, CUDAStream, ExecutionContext
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
+
+
+@torch.inference_mode()
+def test_attention_override_preserves_each_provider_through_graph_replay():
+    from flash_attn.cute.interface import _flash_attn_fwd
+
+    device = torch.device("cuda", 0)
+    generator = torch.Generator(device=device).manual_seed(211)
+    q, k, v = (
+        torch.randn(
+            (1, 4, 513, 128),
+            device=device,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        for _ in range(3)
+    )
+    model = torch.nn.ModuleDict(
+        {"main": Attention(4, 4, 128), "camera": Attention(4, 4, 128)}
+    )
+    inputs = AttentionBatch.single(DenseInput(False, None))
+
+    def execute():
+        return tuple(layer(q, k, v, inputs) for layer in model.values())
+
+    def check(actual):
+        with sdpa_kernel(
+            [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+        ):
+            main = F.scaled_dot_product_attention(q, k, v)
+        camera = _flash_attn_fwd(
+            *(value.transpose(1, 2).contiguous() for value in (q, k, v)),
+            softmax_scale=None,
+            causal=False,
+            window_size_left=None,
+            window_size_right=None,
+            softcap=0.0,
+            num_splits=1,
+            pack_gqa=None,
+            return_lse=True,
+        )[0].transpose(1, 2)
+        torch.testing.assert_close(actual[0], main, rtol=0, atol=0)
+        torch.testing.assert_close(actual[1], camera, rtol=0, atol=0)
+
+    stream = CUDAStream.external(torch.cuda.Stream(device=device))
+    stream.wait(torch.cuda.current_stream(device))
+    with (
+        stream,
+        ExecutionContext(
+            model,
+            attention="torch_fused",
+            attention_overrides={model["camera"]: "flash_attn_4"},
+            stream=stream,
+        ) as context,
+    ):
+        context.prepare(None)
+        check(execute())
+        with CUDAGraph(context=context) as graph:
+            graph.capture(execute)
+            q.mul_(0.5)
+            v.add_(0.25)
+            check(graph.replay())
+
+
+@torch.inference_mode()
+def test_explicit_torch_fused_policy_survives_graph_replay():
+    device = torch.device("cuda", 0)
+    generator = torch.Generator(device=device).manual_seed(91)
+    q, k, v = (
+        torch.randn(
+            (1, 4, 513, 128),
+            device=device,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        for _ in range(3)
+    )
+    attention = Attention(4, 4, 128)
+    inputs = AttentionBatch.single(DenseInput(causal=False, mask=None))
+
+    def reference():
+        with sdpa_kernel(
+            [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+        ):
+            return F.scaled_dot_product_attention(q, k, v)
+
+    def policy():
+        return (
+            torch.backends.cuda.flash_sdp_enabled(),
+            torch.backends.cuda.mem_efficient_sdp_enabled(),
+            torch.backends.cuda.math_sdp_enabled(),
+            torch.backends.cuda.cudnn_sdp_enabled(),
+        )
+
+    initial_policy = policy()
+    stream = CUDAStream.external(torch.cuda.Stream(device=device))
+    stream.wait(torch.cuda.current_stream(device))
+    with (
+        stream,
+        ExecutionContext(
+            attention, attention="torch_fused", stream=stream
+        ) as context,
+    ):
+        context.prepare(None)
+        actual = attention(q, k, v, inputs)
+        torch.testing.assert_close(actual, reference(), rtol=0, atol=0)
+        assert policy() == initial_policy
+        with CUDAGraph(context=context) as graph:
+            graph.capture(lambda: attention(q, k, v, inputs))
+            q.mul_(0.5)
+            v.add_(0.25)
+            actual = graph.replay()
+            torch.testing.assert_close(actual, reference(), rtol=0, atol=0)
+    assert policy() == initial_policy
 
 
 @pytest.mark.parametrize(

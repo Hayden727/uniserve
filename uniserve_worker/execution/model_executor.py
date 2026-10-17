@@ -70,6 +70,7 @@ from uniserve.runtime import (
 from uniserve.runtime.backends import kernel_choices
 from uniserve.runtime.backends.attention import resolve as attention_backend
 from uniserve.runtime.backends.attention.flashinfer import Backend as FlashInfer
+from uniserve.runtime.bindings.convolution import ConvPlan
 from uniserve.runtime.cuda_graph import CUDAGraphError
 from uniserve.runtime.device import canonical_device, process_device_bytes
 from uniserve.runtime.resources import close_resources
@@ -97,6 +98,10 @@ from uniserve_worker.errors import (
     classify,
     invalid_descriptor,
     unsupported_setup,
+)
+from uniserve_worker.execution.attention import (
+    resolve_overrides,
+    select_overrides,
 )
 from uniserve_worker.execution.conditions import (
     CONDITION_PRODUCTS,
@@ -231,6 +236,13 @@ class ModelExecutor:
         self.model, self.worker_config = model, worker_config
         self.expert_group, self.attention_ranks = expert_group, attention_ranks
         self._event_slots = max_inflight + 1
+        self._convolution_plans = {
+            name: ConvPlan.read(path)
+            for name, path in worker_config.convolution_plans
+        }
+        self._attention_overrides = resolve_overrides(
+            model, worker_config.attention_overrides
+        )
         self.attention = attention_backend(
             attention or worker_config.attention_backend or "auto",
             device=canonical_device(worker_config.device),
@@ -248,6 +260,14 @@ class ModelExecutor:
         self.video_postprocessor = capability(model, VideoPostprocessor)
         self.outputs = resolve_outputs(model, worker_config)
         self._declarations = describe_components(model, entries=entry_points)
+        if (
+            unknown := self._convolution_plans.keys()
+            - self._declarations.keys()
+        ):
+            raise invalid_descriptor(
+                "convolution plans name undeclared components: "
+                f"{sorted(unknown)}"
+            )
 
         # Without supplied bindings, every declared component runs standalone
         # on this rank; only video decoders distribute over temporal units.
@@ -493,6 +513,12 @@ class ModelExecutor:
             context: ExecutionContext[object] = ExecutionContext(
                 call.module,
                 attention=self.attention,
+                attention_overrides=select_overrides(
+                    call.module, self._attention_overrides
+                ),
+                matmul=self.worker_config.matmul_backend,
+                grid=self.worker_config.grid_attention_backend,
+                convolution=self._convolution_plans.get(name),
                 stream=stream,
                 # A method declared for one pipeline stage runs on that stage
                 # alone, so its preparation opens no binding over a group the
@@ -850,20 +876,23 @@ class ModelExecutor:
         image_grids: tuple[tuple[int, int, int], ...] = (),
         video_grids: tuple[tuple[int, int, int], ...] = (),
     ) -> ExecutionOutput:
-        """Encode one prompt's tokens at its text capacity.
+        """Encode one prompt with its declared padding semantics.
 
-        The tokens are followed by padding up to ``_text_capacity``. The text
-        encoder attends causally, so the padding never reaches the prompt's
-        rows, whose features are returned. A prompt holding vision blocks
+        An encoder declaring a safe padding token uses ``_text_capacity``;
+        an exact-length encoder sees only the prompt. A prompt holding vision
+        blocks
         passes their features as ``visual``, one row per placeholder in
         prompt order, with the blocks' image and video grids, from which the
         encoder derives the prompt's rotary coordinates; padding is text and
         continues them.
         """
         count = len(token_ids)
-        capacity = self._text_capacity(count)
-        # Token 0 fills the padding; any vocabulary token serves.
-        padded = (*token_ids, *(0,) * (capacity - count))
+        encoder = capability(self.model, TextEncoder)
+        if encoder is None:
+            raise InputError("model has no text encoder")
+        padding = encoder.padding_token_id
+        capacity = count if padding is None else self._text_capacity(count)
+        padded = (*token_ids, *((padding,) * (capacity - count)))
         tokens = self.prepare_text_tokens(padded)
         options = {}
         if visual is not None:
@@ -914,9 +943,9 @@ class ModelExecutor:
         A placeholder prompt filling each capacity, the largest first, runs
         through this rank's text encoder and conditioning encoder, which
         prepares their contexts and, while graphs may be captured, their
-        graphs. Every admitted prompt is padded to one of these capacities,
-        so serving finds its text path prepared. Collective across each
-        encoder's ranks.
+        graphs. Encoders with safe prefix padding reuse those capacities;
+        exact-length encoders prepare other lengths on first use. Collective
+        across each encoder's ranks.
         """
         builder = self.media_builder
         kinds = self.encoder_kinds
@@ -1074,6 +1103,11 @@ class ModelExecutor:
                 pool=self.latent_pool,
                 pages=builder.sample_pages.pages,
                 attention=self.attention,
+                attention_overrides=select_overrides(
+                    call.module, self._attention_overrides
+                ),
+                matmul=self.worker_config.matmul_backend,
+                grid=self.worker_config.grid_attention_backend,
             )
         return self._diffusion
 
@@ -1500,6 +1534,12 @@ class ModelExecutor:
                             call.module,
                             cache=kv_cache.cache if reads_cache else None,
                             attention=self.attention,
+                            attention_overrides=select_overrides(
+                                call.module, self._attention_overrides
+                            ),
+                            matmul=config.matmul_backend,
+                            grid=config.grid_attention_backend,
+                            convolution=self._convolution_plans.get(name),
                             stream=stream,
                             groups=call.groups,
                             derive_host_lengths=False,
@@ -1625,7 +1665,15 @@ class ModelExecutor:
             strict=True,
         ):
             context = ExecutionContext(
-                self.model, stream=stream, experts=exchange
+                self.model,
+                stream=stream,
+                experts=exchange,
+                attention=self.attention,
+                attention_overrides=select_overrides(
+                    self.model, self._attention_overrides
+                ),
+                matmul=config.matmul_backend,
+                grid=config.grid_attention_backend,
             )
             entry = Execution(
                 context,

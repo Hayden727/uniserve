@@ -11,14 +11,18 @@ from uniserve.loading import Config, checkpoint
 pytestmark = pytest.mark.integration
 
 
-@pytest.mark.parametrize("format", ["safetensors", "pt"])
+@pytest.mark.parametrize(
+    "format,suffix",
+    [("safetensors", ".safetensors"), ("pt", ".pt"), ("pt", ".pth")],
+)
 @pytest.mark.parametrize(
     "mode,mmap",
     [("eager", True), ("eager", False), ("layered", True), ("layered", False)],
 )
-def test_reader_slices_follow_declared_sources(tmp_path, format, mode, mmap):
+def test_reader_slices_follow_declared_sources(
+    tmp_path, format, suffix, mode, mmap
+):
     values = torch.arange(24).view(4, 6).float()
-    suffix = ".safetensors" if format == "safetensors" else ".pt"
     first, second = (
         tmp_path / ("first" + suffix),
         tmp_path / ("second" + suffix),

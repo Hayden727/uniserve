@@ -1,0 +1,122 @@
+{
+  "format": "uniserve.sparse-sources.1",
+  "upstream": "FlashAttention CuTe, BSD-3-Clause; see FA4_LICENSE and FA4_AUTHORS",
+  "internal_modifications": "Impossible research/core/kernels/fa4_vsa forward, traversal and TMEM layout; authorized internal transfer",
+  "source_files": [
+    {
+      "destination": "_sparse_sm100/flash_fwd.py",
+      "origin": "core/kernels/fa4_vsa/flash_fwd_sm100.py",
+      "sha256": "b7b223b66242b0c4ae4531b785b87a37b4a65738af21195a14e8af75528a0769",
+      "bytes": 200459
+    },
+    {
+      "destination": "_sparse_sm100/block_sparse.py",
+      "origin": "core/kernels/fa4_vsa/block_sparse_utils.py",
+      "sha256": "152c314ad27bd54601383c41a62867b4a69b5fcf8fb0d074e145bb213a90f623",
+      "bytes": 64269
+    },
+    {
+      "destination": "_sparse_sm100/tmem_layout.py",
+      "origin": "core/kernels/fa4_vsa/tmem_layout.py",
+      "sha256": "834b7f9abdf363fd3a5cdda5f6b281dabdf0741a9bd55d0ef554dff9763b1cd7",
+      "bytes": 21507
+    },
+    {
+      "destination": "_sparse_sm100/utils.py",
+      "origin": "flash_attn/cute/utils.py",
+      "sha256": "fb994e1547600c397b211794072d3152bbd259371f07d21fc266be934e64e2d3",
+      "bytes": 29021
+    },
+    {
+      "destination": "_sparse_sm100/pipeline.py",
+      "origin": "flash_attn/cute/pipeline.py",
+      "sha256": "04eccdaa54239e837c501256b47fa014a411de42706dfffb39750e40f7254307",
+      "bytes": 14269
+    },
+    {
+      "destination": "_sparse_sm100/mask.py",
+      "origin": "flash_attn/cute/mask.py",
+      "sha256": "2bc48e522cf61532dcad26eac1623a5f08ad8cc869ed88a90d3518cbd2b2dec3",
+      "bytes": 35606
+    },
+    {
+      "destination": "_sparse_sm100/softmax.py",
+      "origin": "flash_attn/cute/softmax.py",
+      "sha256": "efb7c68ea5ba75d3c26db0d9c4a8be2003443b989e983cec0d0fb35cfefbb769",
+      "bytes": 25561
+    },
+    {
+      "destination": "_sparse_sm100/seqlen_info.py",
+      "origin": "flash_attn/cute/seqlen_info.py",
+      "sha256": "4532546df92335205660c2bccdc608c8a1c81372900128f2370bac0321e87f01",
+      "bytes": 9849
+    },
+    {
+      "destination": "_sparse_sm100/block_info.py",
+      "origin": "flash_attn/cute/block_info.py",
+      "sha256": "cfcc8a73ac808710104527e083a3f5a41204c870806faf4d2655842d8ad04af7",
+      "bytes": 6176
+    },
+    {
+      "destination": "_sparse_sm100/block_sparsity.py",
+      "origin": "flash_attn/cute/block_sparsity.py",
+      "sha256": "58d9d8ced19b7ab0cc7c4a4b78125025fe9134fb911583166097b0402adbbcbd",
+      "bytes": 16311
+    },
+    {
+      "destination": "_sparse_sm100/pack_gqa.py",
+      "origin": "flash_attn/cute/pack_gqa.py",
+      "sha256": "847bba3d1d23fbe5125e1599782cf3fca4aacbdf315b561bd78d36eb1bd75453",
+      "bytes": 9851
+    },
+    {
+      "destination": "_sparse_sm100/paged_kv.py",
+      "origin": "flash_attn/cute/paged_kv.py",
+      "sha256": "24c05e6df84a466b5ddc21c34a0314afbf960b6bae7dccc56902046d52f444f3",
+      "bytes": 7896
+    },
+    {
+      "destination": "_sparse_sm100/mma_sm100_desc.py",
+      "origin": "flash_attn/cute/mma_sm100_desc.py",
+      "sha256": "8fb60a31e73115ee757fd3bf07a7096c35810fbe7e76b90d5ebe6f2d6944ff1a",
+      "bytes": 10898
+    },
+    {
+      "destination": "_sparse_sm100/blackwell_helpers.py",
+      "origin": "flash_attn/cute/blackwell_helpers.py",
+      "sha256": "db9a33191b4028ae55b93d5710a226f6c8f6037788c9ab13a519f277b49f9aff",
+      "bytes": 48808
+    },
+    {
+      "destination": "_sparse_sm100/named_barrier.py",
+      "origin": "flash_attn/cute/named_barrier.py",
+      "sha256": "98d1cf1f2254203769da8d566f5ddadc755fb1cb3f4e514012da3addb9233c09",
+      "bytes": 1368
+    },
+    {
+      "destination": "_sparse_sm100/tile_scheduler.py",
+      "origin": "flash_attn/cute/tile_scheduler.py",
+      "sha256": "22d0fc5b72ad0a4dcfc51b89a3c849e931fa1e5a954692dac4c1f3a8767389de",
+      "bytes": 31871
+    },
+    {
+      "destination": "_sparse_sm100/fast_math.py",
+      "origin": "flash_attn/cute/fast_math.py",
+      "sha256": "7e5f822bf4d0ba36967558f3ae9a1408b410cb726c31222cd61703569d1be738",
+      "bytes": 492
+    },
+    {
+      "destination": "_sparse_sm100/tensor.py",
+      "origin": "flash_attn/cute/cute_dsl_utils.py",
+      "sha256": "73f4d0fc4ec55a10f8fc258c84a80bf76dcd8127fbee30c380fef6ed9821bc1a",
+      "bytes": 6039
+    }
+  ],
+  "source_adaptations": [
+    "Private relative imports",
+    "CuTe 4.6.2 ThrMma and make_rmem_tensor direct APIs",
+    "Forward dependency subset; no backward entry points",
+    "No disabled layout probes, global compiler patches or unused NamedBarrier.create",
+    "Runtime-owned compile and borrowed tensor launch; no original entry wrapper"
+  ]
+}

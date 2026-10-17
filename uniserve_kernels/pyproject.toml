@@ -18,6 +18,7 @@ dependencies = [
 flash_attn_4 = [
   "flash-attn-4[cu13]==4.0.0b30",
   "nvidia-cutlass-dsl[cu13]==4.6.2",
+  "quack-kernels==0.6.4",
 ]
 # Fused expert-parallel kernels use the locked NVSHMEM Python/native pair.
 megamoe = [
@@ -33,7 +34,7 @@ where = ["src"]
 include = ["uniserve_kernels*"]
 
 [tool.setuptools.package-data]
-uniserve_kernels = ["py.typed", "attention/vsa_native/LICENSE", "megamoe/LICENSE", "diffusion/*.json", "deepgemm/csrc/**/*", "deepgemm/NOTICE", "deepep/csrc/**/*", "deepep/NOTICE"]
+uniserve_kernels = ["py.typed", "attention/FA4_LICENSE", "attention/FA4_AUTHORS", "attention/SPARSE_SOURCES.json", "attention/TILE_PREPARATION_SOURCES.json", "attention/vsa_native/LICENSE", "megamoe/LICENSE", "diffusion/*.json", "deepgemm/csrc/**/*", "deepgemm/NOTICE", "deepep/csrc/**/*", "deepep/NOTICE"]
 
 [tool.uv]
 # Rebuild the compiled extensions when their sources or build target change.

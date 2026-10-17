@@ -12,7 +12,7 @@ from collections.abc import Mapping
 import torch
 
 from uniserve.media import video
-from uniserve.model import VideoPostprocessor as BaseVideoPostprocessor
+from uniserve.model import OverlapPostprocessor
 from uniserve.tensors import BufferConfig, OutputLayout
 
 from .packing import CLIP_FRAMES, CLIP_LATENTS
@@ -40,7 +40,7 @@ def video_clips(num_frames: int) -> tuple[slice, ...]:
     )
 
 
-class VideoPostprocessor(BaseVideoPostprocessor):
+class VideoPostprocessor(OverlapPostprocessor):
     """Remove H3's three-frame decoder padding and cross-fade five-frame overlaps."""  # noqa: E501
 
     def __init__(self, *, frame_rate: int):

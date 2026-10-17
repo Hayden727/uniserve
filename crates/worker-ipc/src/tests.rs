@@ -215,6 +215,7 @@ fn media_admission(prompt_token_ids: Vec<u32>) -> NewRequest {
         prompt_token_ids,
         media_sampling(),
         VideoAdmission {
+            camera: None,
             task: uniserve_core::VideoTask::T2va,
             text_tags,
             conditions: Vec::new(),
@@ -1335,6 +1336,7 @@ fn conditioned_media_admission_round_trips() {
         vec![5, 6, 7, 8],
         media_sampling(),
         VideoAdmission {
+            camera: None,
             task: uniserve_core::VideoTask::Ref2va,
             text_tags: vec![1, 0, 0, 1],
             conditions: reference_conditions(),
@@ -1357,6 +1359,50 @@ fn conditioned_media_admission_round_trips() {
     );
 }
 
+#[test]
+fn camera_grid_and_clean_cells_round_trip_without_audio() {
+    let mut admission = media_admission(vec![5, 6, 7]);
+    let video = admission.video.as_mut().unwrap();
+    video.task = uniserve_core::VideoTask::Camera2v;
+    video.camera = Some(uniserve_core::CameraInput {
+        source: uniserve_core::MediaLocator {
+            name: "camera_input".into(),
+            bytes: 4096,
+        },
+        grid: uniserve_core::CameraGrid {
+            views: 32,
+            columns: 16,
+            order: uniserve_core::CameraOrder::ViewMajor,
+        },
+        clean_cells: vec![0, 15, 496, 511],
+        include_video: true,
+    });
+    admission.validate().unwrap();
+    let request = WorkerRequest::submit(batch_with_calls(
+        5,
+        vec![admission.clone()],
+        vec![call_for(
+            CallKind::Media(MediaCall::LatentPreparation),
+            CallId::new(12, 0),
+        )],
+    ));
+    let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
+    assert_eq!(
+        decoded.batch().unwrap().admissions().next(),
+        Some(&admission)
+    );
+    admission
+        .video
+        .as_mut()
+        .unwrap()
+        .camera
+        .as_mut()
+        .unwrap()
+        .clean_cells
+        .push(512);
+    assert!(admission.validate().is_err());
+}
+
 /// A video admission whose tags do not cover its prompt, or whose `t2va`
 /// task carries conditions, is refused.
 #[test]
@@ -1368,6 +1414,7 @@ fn inconsistent_media_admissions_are_refused() {
             vec![5, 6, 7],
             media_sampling(),
             VideoAdmission {
+                camera: None,
                 task,
                 text_tags,
                 conditions,
@@ -1672,6 +1719,7 @@ fn kv_free_worker_info_round_trips() {
             audio_shift: 3.0,
             frame_rate: 24,
             audio_sample_rate: 32_000,
+            camera_layout: None,
             frames: crate::FrameClips {
                 min_frames: 22,
                 clip_frames: 17,
@@ -2260,4 +2308,148 @@ fn frame_clips_count_decode_units_and_align_requested_frames() {
         .validate()
         .is_err()
     );
+}
+
+#[test]
+fn independent_frame_clips_have_no_tail() {
+    let frames = FrameClips {
+        min_frames: 13,
+        clip_frames: 13,
+        clip_latent_frames: 4,
+        tail_latent_frames: 0,
+    };
+    frames.validate().unwrap();
+    assert_eq!(frames.units(156), 12);
+    assert_eq!(frames.latent_frames(156), 48);
+    assert_eq!(frames.align_up(14), 26);
+    assert_eq!(frames.align_down(25), Some(13));
+    assert!(
+        FrameClips {
+            tail_latent_frames: 1,
+            ..frames
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        FrameClips {
+            min_frames: 14,
+            ..frames
+        }
+        .validate()
+        .is_err()
+    );
+}
+
+#[test]
+fn camera_layout_preserves_retained_columns_across_python_mapping_and_ipc() {
+    let denoiser = VideoDenoiserInfo {
+        tasks: vec!["camera2v".into()],
+        schedule_points: 5,
+        video_shift: 5.0,
+        audio_shift: 0.0,
+        frame_rate: 8,
+        audio_sample_rate: 0,
+        frames: FrameClips {
+            min_frames: 57,
+            clip_frames: 57,
+            clip_latent_frames: 15,
+            tail_latent_frames: 0,
+        },
+        camera_layout: Some(CameraLayout {
+            views: 32,
+            columns: 16,
+            order: uniserve_core::CameraOrder::TimeMajor,
+            frames_per_view: 57,
+            latent_frames_per_view: 15,
+        }),
+        canvases: vec![ServedCanvas {
+            short_edge: 480,
+            aspect_ratio: "26:15".into(),
+            canvas: uniserve_core::Canvas {
+                width: 832,
+                height: 480,
+            },
+        }],
+        references: ReferenceLimits::default(),
+    };
+    denoiser.validate().unwrap();
+    let mapping = serde_json::to_value(&denoiser).unwrap();
+    assert_eq!(mapping["camera_layout"]["order"], "time_major");
+    assert_eq!(mapping["camera_layout"]["columns"], 16);
+    let mapped: VideoDenoiserInfo = serde_json::from_value(mapping.clone()).unwrap();
+    assert_eq!(mapped, denoiser);
+    let info = WorkerInfo {
+        media_components: video_components(),
+        supported_calls: video_components()
+            .into_keys()
+            .map(CallKind::Media)
+            .collect(),
+        video_denoiser: Some(mapped),
+        ..WorkerInfo::default()
+    };
+    let response = WorkerResponse::info(info.clone());
+    let WorkerResponse::Info { info: decoded, .. } =
+        decode_response(&encode_response(&response).unwrap()).unwrap()
+    else {
+        panic!("expected worker info")
+    };
+    assert_eq!(decoded, info);
+
+    // Existing Python startup mappings can omit the optional declaration.
+    let mut legacy = mapping;
+    legacy.as_object_mut().unwrap().remove("camera_layout");
+    let legacy: VideoDenoiserInfo = serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.camera_layout, None);
+}
+
+#[test]
+fn camera_layout_rejects_overflow_and_inconsistent_decode_geometry() {
+    let frames = FrameClips {
+        min_frames: 57,
+        clip_frames: 57,
+        clip_latent_frames: 15,
+        tail_latent_frames: 0,
+    };
+    let layout = CameraLayout {
+        views: 32,
+        columns: 16,
+        order: uniserve_core::CameraOrder::TimeMajor,
+        frames_per_view: 57,
+        latent_frames_per_view: 15,
+    };
+    layout.validate(&frames).unwrap();
+    for invalid in [
+        CameraLayout { views: 0, ..layout },
+        CameraLayout {
+            columns: 0,
+            ..layout
+        },
+        CameraLayout {
+            views: u32::MAX,
+            ..layout
+        },
+        CameraLayout {
+            frames_per_view: u32::MAX,
+            ..layout
+        },
+        CameraLayout {
+            frames_per_view: 58,
+            ..layout
+        },
+        CameraLayout {
+            latent_frames_per_view: 0,
+            ..layout
+        },
+        CameraLayout {
+            latent_frames_per_view: 16,
+            ..layout
+        },
+        CameraLayout {
+            columns: 14,
+            ..layout
+        },
+    ] {
+        assert!(invalid.validate(&frames).is_err(), "{invalid:?}");
+    }
 }

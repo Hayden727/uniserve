@@ -3,8 +3,31 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 
 import torch
+
+
+class Recipe(StrEnum):
+    """Observable sparse attention tiling and accumulation recipes.
+
+    FA4_128X64 uses two alternating KV streams inside one CTA and one query
+    stage. Their raw FP32 accumulators and row statistics merge with exp2
+    before the sole BF16 output rounding.
+    FA4_128X128 uses two query stages, one KV accumulator per query, and a
+    fragment-hoisted 128-row validity mask. Both visit partial keys before
+    complete keys in descending order and round the final result to BF16.
+    """
+
+    FA4_128X64 = "fa4_128x64"
+    FA4_128X128 = "fa4_128x128"
+
+    def validate_tile(self, tile: int) -> None:
+        allowed = (128, 256) if self is Recipe.FA4_128X64 else (256,)
+        if tile not in allowed:
+            raise ValueError(
+                f"{self.value} requires logical tiles in {allowed}"
+            )
 
 
 @dataclass(frozen=True, slots=True)

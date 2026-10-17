@@ -18,6 +18,7 @@ from .attention.config import AttentionParallelConfig
 from .functional._activation import softcap
 from .functional._linear import apply_linear, apply_merged_linear
 from .functional._tensors import as_matrix
+from .gemv import GemvReduction, validate_reduction
 
 
 def _distribution(
@@ -123,8 +124,11 @@ class Linear(nn.Module):
         bias: bool = True,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
+        gemv_reduction: GemvReduction = "default",
     ):
         super().__init__()
+        validate_reduction(gemv_reduction)
+        self.gemv_reduction = gemv_reduction
         if min(in_features, out_features) < 1:
             raise ValueError("linear dimensions must be positive")
         self.in_features = in_features
@@ -156,23 +160,38 @@ class Linear(nn.Module):
         self,
         x: torch.Tensor,
         *,
+        include_bias: bool = True,
+        round_before_bias: bool = False,
         output_dtype: torch.dtype | None = None,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Project rows, optionally deferring bias to a fused epilogue.
+
+        ``include_bias=False`` returns the unbiased product through the same
+        bound GEMM provider, without changing the module's bias parameter.
+        ``round_before_bias`` stores the unbiased product in ``output_dtype``
+        (or the input dtype), then adds bias in that representation. The
+        default lets the GEMM provider fuse bias into its final store.
+        """
         shape = (*x.shape[:-1], self.weight.shape[0])
         dtype = x.dtype if output_dtype is None else output_dtype
         _check_output(out, shape, dtype, x.device)
         encoded = _input(self, x)
+        bias = self.bias if include_bias and not round_before_bias else None
 
         if encoded is x:
-            return apply_linear(
+            result = apply_linear(
                 x,
                 self.weight,
-                self.bias,
+                bias,
                 output_dtype=dtype,
                 out=out,
                 operator=_binding.matmul.get().get(id(self)),
+                gemv_reduction=self.gemv_reduction,
             )
+            if include_bias and round_before_bias and self.bias is not None:
+                result.add_(self.bias)
+            return result
 
         # Quantization flattens leading axes into GEMM rows; a contiguous
         # caller output can absorb the result directly at that row shape.
@@ -184,11 +203,14 @@ class Linear(nn.Module):
         result = apply_linear(
             encoded,
             self.weight,
-            self.bias,
+            bias,
             output_dtype=dtype,
             out=target,
             operator=_binding.matmul.get().get(id(self)),
+            gemv_reduction=self.gemv_reduction,
         ).reshape(shape)
+        if include_bias and round_before_bias and self.bias is not None:
+            result.add_(self.bias)
         return result if out is None else out.copy_(result)
 
 

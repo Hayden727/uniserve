@@ -526,7 +526,8 @@ def loaded_worker_config(
 
     Only a model containing a ``VideoDecoder`` is adjusted: its batch bounds
     and maximum request-pool size become the slot count, and it drops the KV
-    token capacity, attention backend and generation device. Any other
+    token capacity and generation device. Explicit numerical backends remain
+    applicable to media attention and linear layers. Any other
     model's configuration is returned unchanged.
 
     Raises:
@@ -560,7 +561,6 @@ def loaded_worker_config(
         config = replace(
             config,
             max_total_tokens=None,
-            attention_backend=None,
             max_batch_calls=state_slots,
             max_batch_tokens=state_slots,
             max_request_pool_size=state_slots,

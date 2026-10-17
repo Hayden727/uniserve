@@ -2,7 +2,7 @@
 //!
 //! `ModelConfig::load` resolves checkpoint facts, the tokenizer, and what renders requests
 //! at startup: a diffusers pipeline index selects a video model, planned against its
-//! conditioner's vision processor, and otherwise the root `config.json` selects a
+//! conditioner's optional vision processor, and otherwise the root `config.json` selects a
 //! token-generating model with its chat template. [`InputProcessor::new`] then binds the
 //! capabilities the connected worker advertises ([`WorkerCapabilities`]) and the request
 //! renderer they complete ([`RequestRenderer`]), and the result is shared immutably by the
@@ -13,7 +13,7 @@
 //! route through `InputProcessor::preprocess_generation`, which produces a [`GenerationRequest`]
 //! and the [`ResponseOptions`] retained by the frontend, and delegates SenseNova and Bagel
 //! inputs to the sibling `omni` module; `omni` reads the `pub(super)` fields.
-//! [`InputProcessor::preprocess_video_request`] produces a `DiffusionRequest` for MiniMax H3
+//! [`InputProcessor::preprocess_video_request`] produces a `DiffusionRequest` for a video model
 //! through the deployment's `VideoService`.
 
 use std::sync::Arc;
@@ -95,9 +95,9 @@ pub(crate) struct LoadedModel {
 pub(crate) enum LoadedRenderer {
     /// A token model's chat template.
     Chat(Box<HfChatRenderer>),
-    /// A video pipeline's conditioner vision processor geometry; the video
-    /// service built from the denoiser handshake plans requests against it.
-    Video(ProcessorConfig),
+    /// A video pipeline's optional conditioner vision processor; the video
+    /// service plans vision references against it when the model has one.
+    Video(Option<ProcessorConfig>),
 }
 
 /// What renders the served model's API requests into engine requests.
@@ -137,7 +137,7 @@ impl ModelConfig {
     /// Loads model facts and the tokenizer/template resources needed by preprocessing.
     ///
     /// A diffusers pipeline has no chat template and carries its conditioner's
-    /// vision processor geometry instead. The returned `max_model_len` is the
+    /// vision processor when it has one. The returned `max_model_len` is the
     /// configured one, else, for a root configuration, its
     /// `max_position_embeddings` or `EngineSettings::DEFAULT_MAX_MODEL_LEN`,
     /// and for a pipeline the model's default prompt limit.
@@ -162,14 +162,23 @@ impl ModelConfig {
                 })?;
             if description.is_pipeline() {
                 let tokenizer: DynTokenizer = Arc::new(pipeline_tokenizer(&pipeline).await?);
-                // The conditioner's Qwen3-VL processor fixes how condition media
-                // is patched; requests are planned against it.
-                let mut processor = Vec::with_capacity(2);
-                for name in ["preprocessor_config.json", "video_preprocessor_config.json"] {
-                    processor.push(pipeline.component_file("processor", name).await?);
-                }
-                let vision = ProcessorConfig::read(&processor[0], &processor[1])
-                    .map_err(|error| ModelResolutionError::MediaContract(format!("{error:#}")))?;
+                let vision = match description {
+                    ModelDescription::MiniMaxH3 => {
+                        // The Qwen3-VL conditioner patches visual references
+                        // using the checkpoint's image and video processor.
+                        let mut processor = Vec::with_capacity(2);
+                        for name in ["preprocessor_config.json", "video_preprocessor_config.json"] {
+                            processor.push(pipeline.component_file("processor", name).await?);
+                        }
+                        Some(ProcessorConfig::read(&processor[0], &processor[1]).map_err(
+                            |error| ModelResolutionError::MediaContract(format!("{error:#}")),
+                        )?)
+                    }
+                    // UMT5 consumes text only. Camera inputs and VAE latents
+                    // are separate numerical inputs, not vision tokens.
+                    ModelDescription::Wan => None,
+                    _ => unreachable!("pipeline family resolved above"),
+                };
                 let model =
                     Self::from_pipeline(&served_name, description, config.engine.max_model_len)?;
                 return Ok(LoadedModel {
@@ -225,6 +234,7 @@ impl ModelConfig {
             ModelParameters::Bagel(value) => Some(&value.controls),
             ModelParameters::Qwen3
             | ModelParameters::MiniMaxH3
+            | ModelParameters::Wan
             | ModelParameters::DiffusionGemma(_) => None,
         }
     }
@@ -241,7 +251,7 @@ impl ModelConfig {
                 max_cfg_branches: 1,
                 ..Default::default()
             },
-            ModelParameters::MiniMaxH3 => uniserve_core::GenerationLimits {
+            ModelParameters::MiniMaxH3 | ModelParameters::Wan => uniserve_core::GenerationLimits {
                 latent_downsample: 1,
                 max_cfg_branches: 1,
                 ..Default::default()
@@ -303,7 +313,7 @@ impl InputProcessor {
             ModelParameters::Bagel(profile) => {
                 configured_omni_needs(&profile.image_generation, &profile.image_encoders)
             }
-            ModelParameters::MiniMaxH3 => GenerationFeatures::empty(),
+            ModelParameters::MiniMaxH3 | ModelParameters::Wan => GenerationFeatures::empty(),
         };
         validate_runtime_features(&config, &limits, needs)?;
 
@@ -344,7 +354,7 @@ impl InputProcessor {
         }
     }
 
-    /// The video service of a MiniMax H3 deployment; `None` for other models.
+    /// The video service of a video deployment; `None` for other models.
     pub fn video_service(&self) -> Option<&VideoService> {
         match &self.renderer {
             RequestRenderer::Video(video) => Some(video),
@@ -414,7 +424,8 @@ impl InputProcessor {
             ModelParameters::DiffusionGemma(_) => true,
             ModelParameters::SenseNova(_)
             | ModelParameters::Bagel(_)
-            | ModelParameters::MiniMaxH3 => false,
+            | ModelParameters::MiniMaxH3
+            | ModelParameters::Wan => false,
         }
     }
 
@@ -445,7 +456,10 @@ impl InputProcessor {
             request_id: request_id.clone(),
             feature,
         };
-        if matches!(self.config.parameters, ModelParameters::MiniMaxH3) {
+        if matches!(
+            self.config.parameters,
+            ModelParameters::MiniMaxH3 | ModelParameters::Wan
+        ) {
             return Err(reject("generation_endpoint"));
         }
         if has_input_image && !self.supports_image_input() {
@@ -499,7 +513,7 @@ impl InputProcessor {
                         GenerationFeatures::empty()
                     }
             }
-            ModelParameters::MiniMaxH3 => {
+            ModelParameters::MiniMaxH3 | ModelParameters::Wan => {
                 unreachable!("video generation refused above")
             }
         };
@@ -619,7 +633,7 @@ impl InputProcessor {
                     &mut generation,
                     &mut decode,
                 )?,
-                ModelParameters::MiniMaxH3 => {
+                ModelParameters::MiniMaxH3 | ModelParameters::Wan => {
                     unreachable!("generation features checked above")
                 }
             };
@@ -660,9 +674,9 @@ impl InputProcessor {
 /// Shortest explicit video duration, in seconds, the MiniMax H3 API admits.
 pub const MIN_VIDEO_SECONDS: f64 = 4.0;
 
-/// Longest explicit video duration, in seconds, the MiniMax H3 API admits. A deployment may
-/// configure a lower `max_video_seconds` capacity, never a higher one. Worker launches size
-/// resident media state for the same duration unless they are told otherwise.
+/// Longest explicit video duration, in seconds, the ordinary MiniMax H3 API admits.
+/// Camera-only deployments may provision longer concatenated multi-view outputs.
+/// Worker launches size resident media state for the configured duration.
 pub const MAX_VIDEO_SECONDS: f64 = uniserve_engine::WorkerProcessArgs::DEFAULT_MAX_VIDEO_SECONDS;
 
 /// Converts an explicit MiniMax H3 duration into its output frame count at `frame_rate`
@@ -865,6 +879,8 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
     use tokenizers::models::bpe::{BPE, Vocab};
+    use tokenizers::models::unigram::Unigram;
+    use tokenizers::processors::template::TemplateProcessing;
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
     use uniserve_core::{CanvasSampling, GenerationFeatures, GenerationLimits};
 
@@ -963,6 +979,71 @@ mod tests {
             served_model_name: Some("diffusion-gemma".to_owned()),
             ..Config::default()
         }
+    }
+
+    /// A text-conditioned camera pipeline has no vision processor assets.
+    /// Its tokenizer retains the Unigram vocabulary and EOS postprocessor
+    /// used by UMT5 when the export is loaded by the server.
+    #[tokio::test]
+    async fn a_wan_pipeline_loads_its_text_tokenizer_without_a_vision_processor() {
+        let directory = tempfile::tempdir().unwrap();
+        let tokenizer_directory = directory.path().join("tokenizer");
+        fs::create_dir(&tokenizer_directory).unwrap();
+        let vocabulary = [("<pad>", 0.0), ("</s>", 0.0), ("<unk>", 0.0), ("a", -1.0)]
+            .map(|(token, score)| (token.to_owned(), score))
+            .to_vec();
+        let mut tokenizer =
+            TokenizerBuilder::new(Unigram::from(vocabulary, Some(2), false).unwrap());
+        tokenizer.add_special_tokens(
+            &["<pad>", "</s>", "<unk>"].map(|token| AddedToken::from(token, true)),
+        );
+        tokenizer.with_post_processor(Some(
+            TemplateProcessing::builder()
+                .try_single("$A </s>")
+                .unwrap()
+                .special_tokens(vec![("</s>", 1)])
+                .build()
+                .unwrap(),
+        ));
+        tokenizer
+            .save(tokenizer_directory.join("tokenizer.json"), false)
+            .unwrap();
+        fs::write(
+            tokenizer_directory.join("tokenizer_config.json"),
+            json!({
+                "tokenizer_class": "T5TokenizerFast",
+                "model_max_length": 512,
+                "eos_token": "</s>",
+                "pad_token": "<pad>",
+                "unk_token": "<unk>",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("model_index.json"),
+            json!({
+                "_class_name": "WanCameraPipeline",
+                "tokenizer": ["transformers", "T5TokenizerFast"],
+                "text_encoder": ["transformers", "UMT5EncoderModel"],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let LoadedModel {
+            config, tokenizer, ..
+        } = ModelConfig::load(&Config {
+            model: directory.path().to_str().unwrap().to_owned(),
+            served_model_name: Some("camera".to_owned()),
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(config.description(), ModelDescription::Wan);
+        assert_eq!(config.served_name, "camera");
+        assert_eq!(config.max_model_len, 512);
+        assert_eq!(tokenizer.encode("a", true).unwrap(), [3, 1]);
     }
 
     /// The diffusers index beside the root configuration does not make the

@@ -260,11 +260,13 @@ pub enum VideoTask {
     Fl2va,
     /// Image, video and audio references to video and audio.
     Ref2va,
+    /// Camera-grid conditioned video, without an audio track.
+    Camera2v,
 }
 
 impl VideoTask {
     /// Every task, in canonical order.
-    pub const ALL: [Self; 3] = [Self::T2va, Self::Fl2va, Self::Ref2va];
+    pub const ALL: [Self; 4] = [Self::T2va, Self::Fl2va, Self::Ref2va, Self::Camera2v];
 
     /// The task's request name.
     pub const fn as_str(self) -> &'static str {
@@ -272,12 +274,23 @@ impl VideoTask {
             Self::T2va => "t2va",
             Self::Fl2va => "fl2va",
             Self::Ref2va => "ref2va",
+            Self::Camera2v => "camera2v",
         }
     }
 
     /// The task a request name denotes, if any.
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|task| task.as_str() == name)
+    }
+
+    /// Whether the task generates an audio track alongside its video.
+    pub const fn generates_audio(self) -> bool {
+        !matches!(self, Self::Camera2v)
+    }
+
+    /// Whether the task carries image, audio or video reference conditions.
+    pub const fn has_media_conditions(self) -> bool {
+        matches!(self, Self::Fl2va | Self::Ref2va)
     }
 }
 
@@ -311,6 +324,12 @@ pub struct DiffusionRequest {
     pub text_tags: Vec<u8>,
     /// The conditions in request order; empty for `t2va`.
     pub conditions: Vec<VideoCondition>,
+    /// Camera-grid tensors and clean-cell layout for a camera task.
+    #[serde(default)]
+    pub camera: Option<Box<crate::CameraInput>>,
+    /// Owns the camera archive publication until this request retires.
+    #[serde(skip)]
+    pub camera_media: Option<Arc<MediaSource>>,
     /// The shared-memory publication of each condition's media, in request
     /// order; `conditions[i].source` names `media[i]`. The request holds
     /// them, and so keeps their bytes readable, until the engine retires it.
@@ -352,14 +371,31 @@ impl DiffusionRequest {
         }
 
         let served = self.conditions.iter().all(|condition| match self.task {
-            VideoTask::T2va => false,
+            VideoTask::T2va | VideoTask::Camera2v => false,
             VideoTask::Fl2va => condition.role.is_keyframe(),
             VideoTask::Ref2va => true,
         });
-        if !served || (self.task != VideoTask::T2va && self.conditions.is_empty()) {
+        if !served || (self.task.has_media_conditions() && self.conditions.is_empty()) {
             return Err(DiffusionRequestError::Conditions(
                 "the conditions do not fit the task",
             ));
+        }
+        if (self.task == VideoTask::Camera2v) != self.camera.is_some()
+            || self.camera.as_ref().map(|input| &input.source)
+                != self
+                    .camera_media
+                    .as_ref()
+                    .map(|media| media.locator())
+                    .as_ref()
+        {
+            return Err(DiffusionRequestError::Conditions(
+                "a camera task requires its published camera input",
+            ));
+        }
+        if let Some(camera) = &self.camera {
+            camera
+                .validate()
+                .map_err(DiffusionRequestError::Conditions)?;
         }
         if self.media.len() != self.conditions.len()
             || self

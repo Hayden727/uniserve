@@ -208,6 +208,18 @@ table FrameClips {
   tail_latent_frames:uint;
 }
 
+/// Flattening order of camera views and temporal columns.
+enum CameraOrder : ubyte { ViewMajor, TimeMajor }
+
+/// A fixed retained camera grid and the decoded clip taken from each view.
+table CameraLayout {
+  views:uint;
+  columns:uint;
+  order:CameraOrder;
+  frames_per_view:uint;
+  latent_frames_per_view:uint;
+}
+
 /// What a deployment's video denoiser serves: its tasks, its fixed schedule
 /// (sigma points including the clean endpoint, and the per-modality shifts),
 /// the frame rate of every video it generates, in frames per second, the
@@ -225,6 +237,7 @@ table VideoDenoiserInfo {
   frames:FrameClips (required);
   canvases:[ServedCanvas];
   references:ReferenceLimits;
+  camera_layout:CameraLayout;
 }
 
 /// Binds a media call to the component that runs it; the decoder rejects a
@@ -542,7 +555,16 @@ table BatchCommandEnvelope { command:BatchCommand; }
 // `VideoAdmission` and its `uniserve_core::VideoCondition` values, which
 // carry the field semantics.
 
-enum VideoTask : ubyte { T2va, Fl2va, Ref2va }
+enum VideoTask : ubyte { T2va, Fl2va, Ref2va, Camera2v }
+table CameraInput {
+  source_name:string;
+  source_bytes:ulong;
+  views:uint;
+  columns:uint;
+  order:CameraOrder;
+  clean_cells:[uint];
+  include_video:bool = false;
+}
 enum ConditionRole : ubyte { FirstFrame, LastFrame, Reference }
 
 /// A still image resized to `resized`, then the `size` window at (`left`,
@@ -584,6 +606,7 @@ table VideoAdmission {
   task:VideoTask;
   text_tags:[ubyte];
   conditions:[VideoCondition];
+  camera:CameraInput;
 }
 
 table GenerationParams {

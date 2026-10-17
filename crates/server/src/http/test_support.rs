@@ -47,11 +47,16 @@ pub(crate) fn sim_state(parameters: ModelParameters) -> AppState {
 /// DiffusionGemma model runs readouts on its own runtime family and generation
 /// limits, as `build_state` starts it.
 pub(crate) fn sim_runtime(parameters: ModelParameters) -> ServingRuntime {
+    let max_model_len = if matches!(parameters, ModelParameters::Wan) {
+        512
+    } else {
+        4096
+    };
     let model = ModelConfig {
         served_name: SERVED_MODEL.to_string(),
         parameters,
         sampling_defaults: SamplingDefaults::default(),
-        max_model_len: 4096,
+        max_model_len,
         primary_eos_token_id: Some(2),
         eos_token_ids: BTreeSet::from([2]),
     };
@@ -65,6 +70,7 @@ pub(crate) fn sim_runtime(parameters: ModelParameters) -> ServingRuntime {
     );
     let renderer = match &model.parameters {
         ModelParameters::MiniMaxH3 => RequestRenderer::Video(sim_video_service(15.0)),
+        ModelParameters::Wan => RequestRenderer::Video(sim_camera_service(15.0)),
         _ => RequestRenderer::Chat(
             HfChatRenderer::new(
                 Some("{{ messages[0].content }}".to_string()),
@@ -101,6 +107,7 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
             audio_shift: 3.0,
             frame_rate: 24,
             audio_sample_rate: 32_000,
+            camera_layout: None,
             frames: uniserve_engine::FrameClips {
                 min_frames: 22,
                 clip_frames: 17,
@@ -141,6 +148,44 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
         &crate::VideoMediaSettings::default(),
         Default::default(),
         configured_tokenizer(),
+    )
+    .unwrap()
+}
+
+/// A camera-video service with independent 13-frame clips and no audio or
+/// vision tokenizer, on a small canvas for HTTP request tests.
+fn sim_camera_service(max_video_seconds: f64) -> VideoService {
+    VideoService::new(
+        uniserve_engine::VideoDenoiserInfo {
+            tasks: vec!["camera2v".to_owned()],
+            schedule_points: 5,
+            video_shift: 5.0,
+            audio_shift: 0.0,
+            frame_rate: 24,
+            audio_sample_rate: 0,
+            camera_layout: None,
+            frames: uniserve_engine::FrameClips {
+                min_frames: 13,
+                clip_frames: 13,
+                clip_latent_frames: 4,
+                tail_latent_frames: 0,
+            },
+            canvases: vec![uniserve_engine::ServedCanvas {
+                short_edge: 32,
+                aspect_ratio: "1:1".to_owned(),
+                canvas: uniserve_core::Canvas {
+                    width: 32,
+                    height: 32,
+                },
+            }],
+            references: Default::default(),
+        },
+        None,
+        max_video_seconds,
+        1,
+        &crate::VideoMediaSettings::default(),
+        Default::default(),
+        Arc::new(crate::serving::video::presentation::tests::camera_tokenizer()),
     )
     .unwrap()
 }

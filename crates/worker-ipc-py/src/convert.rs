@@ -174,6 +174,7 @@ impl RequestTypes {
         for name in [
             "VideoAdmission",
             "VideoCondition",
+            "CameraInput",
             "MediaLocator",
             "ImageFit",
             "VideoClip",
@@ -899,6 +900,33 @@ fn video_admission_to_py<'py>(
         .map(|condition| video_condition_to_py(py, condition))
         .collect::<PyResult<Vec<_>>>()?;
     dict.set_item(intern!(py, "conditions"), PyTuple::new(py, conditions)?)?;
+    let camera = video
+        .camera
+        .as_ref()
+        .map(|input| {
+            let source = PyDict::new(py);
+            source.set_item("name", &input.source.name)?;
+            source.set_item("bytes", input.source.bytes)?;
+            let fields = PyDict::new(py);
+            fields.set_item("source", construct(py, "MediaLocator", &source)?)?;
+            fields.set_item("views", input.grid.views)?;
+            fields.set_item("columns", input.grid.columns)?;
+            fields.set_item(
+                "order",
+                match input.grid.order {
+                    uniserve_core::CameraOrder::ViewMajor => "view_major",
+                    uniserve_core::CameraOrder::TimeMajor => "time_major",
+                },
+            )?;
+            fields.set_item(
+                "clean_cells",
+                PyTuple::new(py, input.clean_cells.iter().copied())?,
+            )?;
+            fields.set_item("include_video", input.include_video)?;
+            construct(py, "CameraInput", &fields)
+        })
+        .transpose()?;
+    dict.set_item("camera", camera)?;
     construct(py, "VideoAdmission", &dict)
 }
 
@@ -2284,6 +2312,7 @@ mod tests {
                 height: 768,
             },
             VideoAdmission {
+                camera: None,
                 task: uniserve_core::VideoTask::T2va,
                 text_tags: vec![1; 3],
                 conditions: Vec::new(),

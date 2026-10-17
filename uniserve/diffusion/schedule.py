@@ -234,16 +234,21 @@ class RungGrid(FixedGrid):
     training schedule, strictly decreasing; divided by
     ``num_train_timesteps`` it gives ``u`` in (0, 1], which ``shift`` warps
     once in double precision. The clean endpoint follows the last rung, and
-    sigma is then materialized in FP32; network times are ``1 - sigma``
-    formed in FP32, while the analytical coordinates keep the unrounded
-    ``1 - sigma``.
+    sigma is then materialized in FP32. The default ``clean`` network time
+    is ``1 - sigma``, formed in FP32. With ``sigma`` parameterization the
+    network time is ``num_train_timesteps * sigma``, rounded before deriving
+    the numerical sigma, as in Wan. Analytical coordinates retain the
+    unrounded network times in either convention.
     """
 
     rungs: tuple[int, ...]
     shift: float
     num_train_timesteps: float
+    time_parameterization: Literal["clean", "sigma"] = "clean"
 
     def __post_init__(self):
+        if self.time_parameterization not in {"clean", "sigma"}:
+            raise ValueError("unknown rung time parameterization")
         if not _is_positive(self.num_train_timesteps):
             raise ValueError("num_train_timesteps must be finite and positive")
         if (
@@ -274,6 +279,14 @@ class RungGrid(FixedGrid):
             for rung in (*self.rungs, 0)
         )
         sigma = torch.tensor(sigmas, dtype=torch.float32, device=device)
+        if self.time_parameterization == "sigma":
+            # Wan rounds the warped training time before deriving sigma.
+            # Multiplying an already rounded sigma can change its FP32 bits.
+            times = tuple(value * self.num_train_timesteps for value in sigmas)
+            timesteps = torch.tensor(times, dtype=torch.float32, device=device)
+            return Schedule(
+                timesteps, timesteps / self.num_train_timesteps, times
+            )
         return Schedule(
             1.0 - sigma, sigma, tuple(1.0 - value for value in sigmas)
         )

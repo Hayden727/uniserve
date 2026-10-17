@@ -256,6 +256,7 @@ impl MediaStorage {
         rank_bytes: &[u64],
         components: &BTreeMap<String, crate::ComponentConfig>,
         routing: &BTreeMap<MediaCall, String>,
+        camera_outputs: bool,
     ) -> Self {
         let ranks = rank_bytes.len() as u32;
         let holders = routing
@@ -271,7 +272,12 @@ impl MediaStorage {
                     .filter(|(_, component)| *component == name)
                     .flat_map(|(call, _)| call.readers())
                     .filter(|reader| !reader.reads_resident_state())
-                    .filter_map(|reader| routing.get(reader));
+                    .filter_map(|reader| routing.get(reader))
+                    .chain(
+                        (camera_outputs && routing.get(&MediaCall::Denoising) == Some(name))
+                            .then(|| routing.get(&MediaCall::Muxing))
+                            .flatten(),
+                    );
                 for component in std::iter::once(name).chain(consumers) {
                     if let Some(config) = components.get(component) {
                         holding.extend(config.ranks.iter().map(|rank| *rank as u32));

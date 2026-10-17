@@ -245,6 +245,17 @@ class Worker:
             raise unsupported_setup(str(error)) from error
 
         try:
+            # BLAS algorithm selection is process-wide. Apply it before any
+            # weights execute, so preparation and later graph replay share the
+            # same numerical policy on every stream of this worker.
+            if (
+                distributed.device.type == "cuda"
+                and config.execution.blas_workspace_size is not None
+            ):
+                for backend in ("cublas", "cublaslt"):
+                    torch.backends.cuda.blas_workspace_size(
+                        config.execution.blas_workspace_size, backend=backend
+                    )
             try:
                 bindings = (
                     {}
@@ -899,7 +910,10 @@ class Worker:
         # A host rank is ready once its codecs load, so a missing codec
         # surfaces here and not under a request.
         if self.codec_slot:
-            require_media_codecs(VIDEO_CODEC, AUDIO_CODEC)
+            require_media_codecs(
+                VIDEO_CODEC,
+                AUDIO_CODEC if self.runner.audio_decoder is not None else None,
+            )
         self.runner.complete_startup()
         check_startup_storage(
             self.worker_config,

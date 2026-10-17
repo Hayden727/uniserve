@@ -9,6 +9,7 @@ from typing import Generic, Literal, TypeVar
 
 import torch
 
+from uniserve.diffusion.solver import ReNoiseInput
 from uniserve.distributed import DeviceMesh
 from uniserve.nn.attention import AttentionBatch
 from uniserve.nn.routing import RouteSpan
@@ -156,6 +157,7 @@ class LatentInput:
 
     tensor: torch.Tensor
     timestep: torch.Tensor
+    solver_inputs: ReNoiseInput | None = None
 
 
 @dataclass(frozen=True)

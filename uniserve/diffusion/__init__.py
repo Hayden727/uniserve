@@ -15,6 +15,8 @@ from .schedule import (
 from .solver import (
     CleanSampleEulerSolver,
     EulerSolver,
+    ReNoiseInput,
+    ReNoiseSolver,
     Solver,
     clean_sample_to_velocity,
     euler_step,
@@ -41,6 +43,8 @@ __all__ = [
     "fuse_heads",
     "CleanSampleEulerSolver",
     "EulerSolver",
+    "ReNoiseInput",
+    "ReNoiseSolver",
     "Solver",
     "clean_sample_to_velocity",
     "euler_step",

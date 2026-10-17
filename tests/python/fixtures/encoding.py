@@ -8,9 +8,9 @@ from torch import nn
 
 from uniserve.model import (
     ComponentEntry,
+    DecoderTextEncoder,
     Encoder,
     EntryPoint,
-    TextEncoder,
     TransformerDecoder,
 )
 from uniserve.nn.attention import (
@@ -62,7 +62,7 @@ class Model(nn.Module):
                     embedding.weight
                 )
             )
-        self.text_encoder = TextEncoder(
+        self.text_encoder = DecoderTextEncoder(
             TransformerDecoder(
                 embedding, nn.ModuleDict({"0": Residual()}), nn.Identity()
             ),

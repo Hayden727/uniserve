@@ -9,7 +9,7 @@ import pytest
 
 from uniserve_worker.errors import WorkerError
 from uniserve_worker.execution.host import HostLane
-from uniserve_worker.media.container import AvMuxConfig
+from uniserve_worker.media.container import AvMuxConfig, encode_video_unit
 from uniserve_worker.media.mux import MediaEncoder, MediaMux
 from uniserve_worker.protocol.identity import CallId, RequestKey
 from uniserve_worker.transport.shm import HostBorrow
@@ -19,13 +19,13 @@ pytestmark = pytest.mark.unit
 CALL = CallId(1, 0)
 
 
-def _config() -> AvMuxConfig:
+def _config(audio_rate: int = 32000) -> AvMuxConfig:
     return AvMuxConfig(
         width=32,
         height=16,
         frame_count=6,
         frame_rate=24,
-        audio_rate=32000,
+        audio_rate=audio_rate,
         video_unit_frames=(4, 2),
     )
 
@@ -46,10 +46,12 @@ def _run(lane: HostLane, schedule):
     return task.promise.result(timeout=30)
 
 
-def test_borrowed_and_imported_units_assemble_with_audio_into_an_artifact(
+@pytest.mark.parametrize("audio_rate", (0, 32000))
+def test_borrowed_and_imported_units_assemble_into_an_artifact(
     lane,
+    audio_rate,
 ):
-    config = _config()
+    config = _config(audio_rate)
     red = np.zeros((4, 16, 32, 3), dtype=np.uint8)
     red[..., 0] = 255
     blue = np.zeros((2, 16, 32, 3), dtype=np.uint8)
@@ -86,10 +88,12 @@ def test_borrowed_and_imported_units_assemble_with_audio_into_an_artifact(
         assert released == [True]
 
         mux.open(request, config=config)
-        pcm = np.zeros((8000, 2), dtype=np.int16)
-        _run(
-            lane, lambda reservation: mux.audio(request, pcm, reservation, CALL)
-        )
+        if audio_rate:
+            pcm = np.zeros((8000, 2), dtype=np.int16)
+            _run(
+                lane,
+                lambda reservation: mux.audio(request, pcm, reservation, CALL),
+            )
         for unit in units:
             _run(
                 lane,
@@ -104,6 +108,7 @@ def test_borrowed_and_imported_units_assemble_with_audio_into_an_artifact(
             ),
         )
     finally:
+        mux.close()
         segment.close()
         segment.unlink()
 
@@ -116,7 +121,11 @@ def test_borrowed_and_imported_units_assemble_with_audio_into_an_artifact(
     with av.open(io.BytesIO(encoded)) as container:
         video = container.streams.video[0]
         assert (video.width, video.height, video.average_rate) == (32, 16, 24)
-        assert container.streams.audio[0].sample_rate == 32000
+        if audio_rate:
+            assert container.streams.audio[0].sample_rate == 32000
+        else:
+            assert len(container.streams) == 1
+            assert not container.streams.audio
         frames = tuple(container.decode(video))
         assert len(frames) == 6
         for index, frame in enumerate(frames):
@@ -141,20 +150,55 @@ def test_a_unit_whose_bytes_do_not_form_frames_fails_its_task(lane):
         )
 
 
-def test_a_dropped_request_refuses_further_assembly(lane):
-    config = _config()
+@pytest.mark.parametrize("audio_rate", (0, 32000))
+def test_a_dropped_request_refuses_further_assembly(lane, audio_rate):
+    config = _config(audio_rate)
     request = RequestKey(1, 9, 0)
     mux = MediaMux(rank=0)
     mux.open(request, config=config)
-    audio = mux.audio(
-        request, np.zeros((8000, 2), dtype=np.int16), lane.reserve(), CALL
-    )
+    if audio_rate:
+        task = mux.audio(
+            request, np.zeros((8000, 2), dtype=np.int16), lane.reserve(), CALL
+        )
+    else:
+        unit = encode_video_unit(
+            config, np.zeros((4, 16, 32, 3), dtype=np.uint8)
+        )
+        task = mux.append_units(request, (unit,), lane.reserve(), CALL)
 
     # The session is discarded after its task was scheduled: the task finds
     # the container closed, and the request has no session left.
     mux.drop(request.request_id)
-    audio.submit_if_ready()
+    task.submit_if_ready()
     with pytest.raises(WorkerError, match="discarded"):
-        audio.promise.result(timeout=30)
+        task.promise.result(timeout=30)
     with pytest.raises(WorkerError, match="no active session"):
         mux.finalize_artifact(request, lane.reserve(), CALL)
+
+
+def test_video_only_session_rejects_audio_tasks(lane):
+    request = RequestKey(1, 10, 0)
+    mux = MediaMux(rank=0)
+    mux.open(request, config=_config(0))
+    reservation = lane.reserve()
+    try:
+        with pytest.raises(WorkerError, match="video-only media has no audio"):
+            mux.audio(
+                request, np.zeros((8000, 2), dtype=np.int16), reservation, CALL
+            )
+    finally:
+        reservation.abandon()
+        mux.close()
+
+
+def test_session_with_audio_requires_its_audio_task_before_finalization(lane):
+    request = RequestKey(1, 11, 0)
+    mux = MediaMux(rank=0)
+    mux.open(request, config=_config())
+    reservation = lane.reserve()
+    try:
+        with pytest.raises(WorkerError, match="precedes the audio track"):
+            mux.finalize_artifact(request, reservation, CALL)
+    finally:
+        reservation.abandon()
+        mux.close()

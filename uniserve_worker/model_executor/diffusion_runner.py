@@ -210,6 +210,9 @@ class DiffusionRunner(ModelRunner):
         pool: LatentPool,
         pages: int,
         attention="auto",
+        attention_overrides=None,
+        matmul="auto",
+        grid="auto",
     ) -> DiffusionRunner:
         """Prepare a standalone denoiser's runner for layouts up to a bound.
 
@@ -233,6 +236,9 @@ class DiffusionRunner(ModelRunner):
         context: ExecutionContext[object] = ExecutionContext(
             call.module,
             attention=attention,
+            attention_overrides=attention_overrides,
+            matmul=matmul,
+            grid=grid,
             stream=stream,
             groups=call.groups,
             derive_host_lengths=False,

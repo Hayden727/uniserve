@@ -416,12 +416,11 @@ impl EngineSettings {
             self.max_model_len.map(|len| len > 0).unwrap_or(true),
             "max_model_len must be greater than 0"
         );
-        let video_seconds = crate::serving::MIN_VIDEO_SECONDS..=crate::serving::MAX_VIDEO_SECONDS;
         anyhow::ensure!(
-            video_seconds.contains(&self.max_video_seconds),
-            "max_video_seconds must lie in [{}, {}], got {}",
-            video_seconds.start(),
-            video_seconds.end(),
+            self.max_video_seconds.is_finite()
+                && self.max_video_seconds >= crate::serving::MIN_VIDEO_SECONDS,
+            "max_video_seconds must be finite and at least {}, got {}",
+            crate::serving::MIN_VIDEO_SECONDS,
             self.max_video_seconds
         );
         WorkerConfig::validate_all(&self.workers)?;
@@ -477,15 +476,16 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
-    /// A video capacity must lie within the API's [4, 15] second range.
+    /// Model-specific duration ceilings are checked when the worker binds.
     #[test]
-    fn max_video_seconds_outside_the_api_range_is_rejected() {
+    fn max_video_seconds_requires_a_finite_positive_capacity() {
         for (seconds, valid) in [
             (4.0, true),
             (15.0, true),
             (3.9, false),
-            (15.5, false),
+            (228.0, true),
             (f64::NAN, false),
+            (f64::INFINITY, false),
         ] {
             let mut config = Config::default();
             config.engine.max_video_seconds = seconds;

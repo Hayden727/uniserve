@@ -681,7 +681,9 @@ impl ConditionPlan {
                     clips.clip_latent_frames * rows_per_frame;
                     clips.units(clip.vae_frames) as usize
                 ];
-                units.push(clips.tail_latent_frames * rows_per_frame);
+                if clips.tail_latent_frames > 0 {
+                    units.push(clips.tail_latent_frames * rows_per_frame);
+                }
                 units
             }
             Prepared::Audio(_) => Vec::new(),
@@ -1220,11 +1222,11 @@ fn check_conditions(
     conditions: &[ConditionSpec],
     limits: &PlanLimits,
 ) -> Result<(), VideoInputError> {
-    if task == VideoTask::T2va {
+    if !task.has_media_conditions() {
         if !conditions.is_empty() {
             return Err(VideoInputError::invalid(
                 RequestField::Conditions,
-                "t2va takes no conditions",
+                "this video task takes no media reference conditions",
             ));
         }
         return Ok(());
@@ -1542,14 +1544,15 @@ fn plan_reference(
 /// Returns [`VideoInputError::Invalid`] naming the first field at fault, and
 /// [`VideoInputError::Internal`] when `media` and `conditions` differ in
 /// length.
-pub fn plan_request(
+pub fn plan_request<'a>(
     task: VideoTask,
     target: &Target<'_>,
     conditions: &[ConditionSpec],
     media: &[MediaFacts],
-    vision: &ProcessorConfig,
+    vision: impl Into<Option<&'a ProcessorConfig>>,
     limits: &PlanLimits,
 ) -> Result<RequestPlan, VideoInputError> {
+    let vision = vision.into();
     if media.len() != conditions.len() {
         return Err(VideoInputError::internal(format!(
             "{} conditions were planned with {} probed media",
@@ -1573,6 +1576,9 @@ pub fn plan_request(
     let mut plans = Vec::with_capacity(conditions.len());
     let mut keyframes = 0;
     for (index, (condition, facts)) in conditions.iter().zip(media).enumerate() {
+        let vision = vision.ok_or_else(|| {
+            VideoInputError::condition(index, "this deployment has no vision condition processor")
+        })?;
         let plan = match (condition.role, facts) {
             (ConditionRole::Keyframe, MediaFacts::Image(image)) => {
                 keyframes += 1;

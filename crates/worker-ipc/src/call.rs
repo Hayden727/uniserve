@@ -1092,6 +1092,8 @@ pub struct VideoAdmission {
     pub text_tags: Vec<u8>,
     /// The conditions in request order.
     pub conditions: Vec<uniserve_core::VideoCondition>,
+    /// Camera tensors and latent-grid metadata, only for camera generation.
+    pub camera: Option<uniserve_core::CameraInput>,
 }
 
 /// Request-start framing. Carries the per-domain parameters a request
@@ -1220,9 +1222,18 @@ impl NewRequest {
                 "every video prompt token requires one tag"
             );
             ensure_valid!(
-                (video.task == uniserve_core::VideoTask::T2va) == video.conditions.is_empty(),
+                video.task.has_media_conditions() != video.conditions.is_empty(),
                 "only a conditioned video task carries conditions"
             );
+            ensure_valid!(
+                (video.task == uniserve_core::VideoTask::Camera2v) == video.camera.is_some(),
+                "a camera task requires its camera input"
+            );
+            if let Some(camera) = &video.camera
+                && let Err(message) = camera.validate()
+            {
+                bail_invalid!("{message}");
+            }
             for condition in &video.conditions {
                 if let Err(message) = condition.validate() {
                     bail_invalid!("{message}");

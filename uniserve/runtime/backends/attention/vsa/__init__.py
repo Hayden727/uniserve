@@ -7,7 +7,7 @@ from importlib import import_module
 
 import torch
 
-from uniserve.nn.attention.vsa.inputs import BlockInput, Pattern
+from uniserve.nn.attention.vsa.inputs import BlockInput, Pattern, Recipe
 
 
 class Operator:
@@ -32,6 +32,7 @@ class Operator:
         dtype,
         workspace,
         transient=None,
+        recipe: Recipe | None = None,
     ):
         if min(num_heads, head_dim) < 1 or len(pattern.row_counts) not in (
             1,
@@ -48,6 +49,7 @@ class Operator:
             dtype,
         )
         self.workspace, self._closed = workspace, False
+        self.recipe = recipe
         # ``transient(role, requirements, device)`` lends per-call work areas
         # that every operator of the owning context shares; without it the
         # operator allocates its own.
@@ -127,6 +129,17 @@ class Backend:
 
     name: str
     operator_class: type[Operator]
+    recipes: tuple[Recipe, ...] = ()
+
+    def prepare_tiles(self, q, k, v, gate, layout, rotary, *, transient=None):
+        """Rotate, pack and pool projections using this provider's recipe.
+
+        Providers implementing this capability return four padded SHD rows
+        and three THD means. The caller owns their borrowed storage lifetime.
+        """
+        raise ValueError(
+            f"VSA backend {self.name!r} has no fused tile preparation"
+        )
 
     def workspace_buffers(
         self,
@@ -152,6 +165,7 @@ class Backend:
         dtype: torch.dtype,
         workspace,
         transient=None,
+        recipe: Recipe | None = None,
     ):
         """Build an operator bound to one pattern.
 
@@ -159,6 +173,14 @@ class Backend:
         workspace. ``transient`` lends the owning context's shared per-call
         work areas (see ``ExecutionContext.scratch``).
         """
+        if recipe is not None:
+            if not isinstance(recipe, Recipe):
+                raise TypeError("VSA requires a typed numerical recipe")
+            recipe.validate_tile(pattern.tile)
+            if recipe not in self.recipes:
+                raise ValueError(
+                    f"VSA backend does not implement {recipe.value}"
+                )
         return self.operator_class(
             pattern,
             num_heads=num_heads,
@@ -166,6 +188,7 @@ class Backend:
             dtype=dtype,
             workspace=workspace,
             transient=transient,
+            recipe=recipe,
         )
 
 
@@ -173,7 +196,7 @@ class Backend:
 _PROVIDERS = ("sm100", "sm90", "flashinfer", "triton")
 
 
-def resolve(backend, *, device, tile):
+def resolve(backend, *, device, tile, recipe: Recipe | None = None):
     """Return the Backend for a name or instance that serves ``tile``.
 
     ``backend`` is a name, an existing instance, or ``"auto"``, which probes
@@ -185,14 +208,25 @@ def resolve(backend, *, device, tile):
             ``tile``-row tiles on ``device``.
         ValueError: An unknown backend name.
     """
+    if recipe is not None:
+        if not isinstance(recipe, Recipe):
+            raise TypeError("VSA requires a typed numerical recipe")
+        recipe.validate_tile(tile)
     if isinstance(backend, Backend):
+        if recipe is not None and recipe not in backend.recipes:
+            raise ValueError(f"VSA backend does not implement {recipe.value}")
         return backend
     # Every provider runs CUDA kernels; other devices have none to probe.
     cuda = torch.device(device).type == "cuda"
     if backend == "auto":
         for name in _PROVIDERS:
             candidate = import_module(f"{__name__}.{name}")
-            if cuda and tile in candidate.TILES and candidate.available(device):
+            if (
+                cuda
+                and tile in candidate.TILES
+                and (recipe is None or recipe in candidate.Backend.recipes)
+                and candidate.available(device)
+            ):
                 return candidate.Backend()
         raise RuntimeError(
             f"no installed VSA backend serves {tile}-row tiles on {device}"
@@ -201,6 +235,10 @@ def resolve(backend, *, device, tile):
     if backend not in _PROVIDERS:
         raise ValueError(f"unknown VSA backend {backend!r}")
     module = import_module(f"{__name__}.{backend}")
+    if recipe is not None and recipe not in module.Backend.recipes:
+        raise ValueError(
+            f"VSA backend {backend!r} does not implement {recipe.value}"
+        )
     if not cuda or tile not in module.TILES or not module.available(device):
         raise RuntimeError(
             f"VSA backend {backend!r} does not serve {tile}-row tiles on "

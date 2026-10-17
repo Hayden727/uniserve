@@ -6,6 +6,7 @@ without re-encoding and must still preserve frame order, dimensions and clocks.
 """
 
 import io
+from dataclasses import replace
 
 import av
 import numpy as np
@@ -26,19 +27,20 @@ from uniserve_worker.media.mux import (
 pytestmark = pytest.mark.integration
 
 
-def _config() -> AvMuxConfig:
+def _config(audio_rate: int = 32000) -> AvMuxConfig:
     return AvMuxConfig(
         width=32,
         height=16,
         frame_count=6,
         frame_rate=24,
-        audio_rate=32000,
+        audio_rate=audio_rate,
         video_unit_frames=(4, 2),
     )
 
 
-def test_encoded_units_and_audio_assemble_into_a_decodable_mp4():
-    config = _config()
+@pytest.mark.parametrize("audio_rate", (0, 32000))
+def test_encoded_units_assemble_into_a_decodable_mp4(audio_rate):
+    config = _config(audio_rate)
     red = np.zeros((4, 16, 32, 3), dtype=np.uint8)
     red[..., 0] = 255
     blue = np.zeros((2, 16, 32, 3), dtype=np.uint8)
@@ -47,22 +49,31 @@ def test_encoded_units_and_audio_assemble_into_a_decodable_mp4():
         encode_video_unit(config, red),
         encode_video_unit(config, blue),
     )
-    audio = encode_audio_track(config, np.zeros((8000, 2), dtype=np.int16))
+    audio = (
+        encode_audio_track(config, np.zeros((8000, 2), dtype=np.int16))
+        if audio_rate
+        else None
+    )
     # Rounds arrive one at a time; the artifact is assembled once the audio
-    # track follows the last of them.
+    # track, when configured, follows the last of them.
     session = AvMuxSession(config)
     session.append(units[:1])
     session.append(units[1:])
     encoded = session.finalize(audio)
 
     with av.open(io.BytesIO(encoded)) as container:
-        video, track = container.streams.video[0], container.streams.audio[0]
+        video = container.streams.video[0]
         assert (video.width, video.height, video.average_rate) == (32, 16, 24)
-        assert (track.sample_rate, track.layout.name) == (32000, "stereo")
-        assert (
-            abs(float(track.duration * track.time_base) - 6 / 24)
-            <= 1024 / 32000
-        )
+        if audio_rate:
+            track = container.streams.audio[0]
+            assert (track.sample_rate, track.layout.name) == (32000, "stereo")
+            assert (
+                abs(float(track.duration * track.time_base) - 6 / 24)
+                <= 1024 / 32000
+            )
+        else:
+            assert len(container.streams) == 1
+            assert not container.streams.audio
         frames = tuple(container.decode(video))
         assert len(frames) == 6
         for index, frame in enumerate(frames):
@@ -70,9 +81,53 @@ def test_encoded_units_and_audio_assemble_into_a_decodable_mp4():
             pixels = frame.to_ndarray(format="rgb24").mean((0, 1))
             assert pixels.argmax() == (0 if index < 4 else 2)
             assert pixels.max() > 240
-    with av.open(io.BytesIO(encoded)) as container:
-        decoded = tuple(container.decode(audio=0))
-        assert sum(frame.samples for frame in decoded) >= 8000
+    if audio_rate:
+        with av.open(io.BytesIO(encoded)) as container:
+            decoded = tuple(container.decode(audio=0))
+            assert sum(frame.samples for frame in decoded) >= 8000
+
+
+def test_audio_rate_cannot_be_negative():
+    with pytest.raises(ValueError, match="audio rate must be nonnegative"):
+        _config(-1)
+
+
+def test_video_only_media_rejects_audio_encoding():
+    with pytest.raises(ValueError, match="video-only media has no audio"):
+        encode_audio_track(_config(0), np.zeros((8000, 2), dtype=np.int16))
+
+
+@pytest.mark.parametrize("audio_rate", (0, 32000))
+def test_finalization_requires_audio_to_match_the_configured_tracks(audio_rate):
+    config = _config(audio_rate)
+    session = AvMuxSession(config)
+    try:
+        session.append(
+            tuple(
+                encode_video_unit(
+                    config, np.zeros((frames, 16, 32, 3), dtype=np.uint8)
+                )
+                for frames in config.video_unit_frames
+            )
+        )
+        audio = encode_audio_track(
+            replace(config, audio_rate=32000),
+            np.zeros((8000, 2), dtype=np.int16),
+        )
+        if audio_rate:
+            with pytest.raises(ValueError, match="no encoded audio"):
+                session.finalize()
+            encoded = session.finalize(audio)
+        else:
+            with pytest.raises(
+                ValueError, match="video-only media has no audio"
+            ):
+                session.finalize(audio)
+            encoded = session.finalize()
+        with av.open(io.BytesIO(encoded)) as container:
+            assert len(tuple(container.decode(video=0))) == 6
+    finally:
+        session.close()
 
 
 def test_assembly_requires_every_media_unit_of_the_request():
@@ -95,8 +150,6 @@ def test_assembly_requires_every_media_unit_of_the_request():
 def test_a_product_row_carries_one_encoded_unit_and_its_length(
     frames, height, width
 ):
-    from dataclasses import replace
-
     import torch
 
     config = replace(

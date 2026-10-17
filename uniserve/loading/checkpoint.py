@@ -76,7 +76,10 @@ class Config:
             name for name in listed if PurePosixPath(name).parent == directory
         )
         formats = ("safetensors", "pt") if io.format == "auto" else (io.format,)
-        suffixes = {"safetensors": {".safetensors"}, "pt": {".pt", ".bin"}}
+        suffixes = {
+            "safetensors": {".safetensors"},
+            "pt": {".pt", ".pth", ".bin"},
+        }
 
         if self.filenames:
             for filename in self.filenames:
@@ -253,12 +256,12 @@ class Source:
             )
         suffixes = {path.suffix for path in self.files}
         supported = (
-            {".safetensors", ".pt", ".bin"}
+            {".safetensors", ".pt", ".pth", ".bin"}
             if io.format == "auto"
             else (
                 {".safetensors"}
                 if io.format == "safetensors"
-                else {".pt", ".bin"}
+                else {".pt", ".pth", ".bin"}
             )
         )
         if not suffixes.issubset(supported):
@@ -272,7 +275,7 @@ class Source:
             return _LayeredReader(self, io)
         if suffixes.issubset({".safetensors"}):
             return _SafetensorsReader(self, io)
-        if suffixes.issubset({".pt", ".bin"}):
+        if suffixes.issubset({".pt", ".pth", ".bin"}):
             return _TorchReader(self, io)
         raise ValueError(
             "one checkpoint source must use a single file encoding"
@@ -825,7 +828,7 @@ class _DummyReader(Reader):
 def _reader_type(path):
     if path.suffix == ".safetensors":
         return _SafetensorsReader
-    if path.suffix in {".pt", ".bin"}:
+    if path.suffix in {".pt", ".pth", ".bin"}:
         return _TorchReader
     raise ValueError(f"unsupported checkpoint file {path}")
 

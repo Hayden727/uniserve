@@ -206,6 +206,10 @@ impl WorkerProcessArgs {
     pub const DEFAULT_MEM_FRACTION_STATIC: f64 = 0.70;
     /// Attention provider selection: the worker picks one per call.
     pub const DEFAULT_ATTENTION_BACKEND: &'static str = "auto";
+    /// Grid attention segment provider selection follows the call's device.
+    pub const DEFAULT_GRID_ATTENTION_BACKEND: &'static str = "auto";
+    /// Matrix multiplication provider selection follows each weight's representation.
+    pub const DEFAULT_MATMUL_BACKEND: &'static str = "auto";
     /// CUDA graph policy that captures what the deployment's calls need.
     pub const DEFAULT_GRAPH_POLICY: &'static str = "auto";
     /// FlashInfer workspace capacity in bytes.
@@ -263,6 +267,11 @@ impl Default for WorkerProcessArgs {
                 + crate::scheduler::MAX_GUIDANCE_PREFIX_ROWS)
                 as u32,
             attention_backend: Self::DEFAULT_ATTENTION_BACKEND.into(),
+            grid_attention_backend: Self::DEFAULT_GRID_ATTENTION_BACKEND.into(),
+            matmul_backend: Self::DEFAULT_MATMUL_BACKEND.into(),
+            attention_overrides: Default::default(),
+            convolution_plans: Default::default(),
+            blas_workspace_size: None,
             transfer: Default::default(),
             load_format: Self::DEFAULT_LOAD_FORMAT.to_string(),
             download_dir: None,
@@ -353,7 +362,8 @@ impl WorkerProcessArgs {
     /// Only the process identity and the descriptor's path travel on argv.
     ///
     /// `rank` must index `self.ranks`. Fails when a host-relative rank value
-    /// does not fit `u32` or the component configuration does not serialize.
+    /// does not fit `u32`, a grid provider is unknown, or the component
+    /// configuration does not serialize.
     fn launch_descriptor(
         &self,
         rank: u32,
@@ -362,6 +372,13 @@ impl WorkerProcessArgs {
         rendezvous_listen_fd: Option<std::os::fd::RawFd>,
         expert_listen_fd: Option<std::os::fd::RawFd>,
     ) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(
+            matches!(
+                self.grid_attention_backend.as_str(),
+                "auto" | "torch" | "flash_attn_4" | "flash_attn_4_sm100"
+            ),
+            "grid attention backend must be auto, torch, flash_attn_4 or flash_attn_4_sm100"
+        );
         let depth = self.queue_depth.max(1);
         // Resolve mechanism ownership from the physical rank's incident edges.
         let (transfer_backends, publish_backends) =
@@ -492,6 +509,20 @@ impl WorkerProcessArgs {
         );
         fields.insert("max_total_tokens".into(), json!(self.max_total_tokens));
         fields.insert("attention_backend".into(), json!(self.attention_backend));
+        fields.insert(
+            "grid_attention_backend".into(),
+            json!(self.grid_attention_backend),
+        );
+        fields.insert("matmul_backend".into(), json!(self.matmul_backend));
+        fields.insert(
+            "attention_overrides".into(),
+            json!(self.attention_overrides),
+        );
+        fields.insert("convolution_plans".into(), json!(self.convolution_plans));
+        fields.insert(
+            "blas_workspace_size".into(),
+            json!(self.blas_workspace_size),
+        );
         fields.insert("block_size".into(), json!(self.block_size));
         fields.insert("max_batch_calls".into(), json!(self.max_batch_calls));
         fields.insert("max_batch_tokens".into(), json!(self.max_batch_tokens));
@@ -1544,9 +1575,63 @@ impl Drop for RankProcess {
 
 #[cfg(test)]
 mod tests {
-    use super::{LaneConfig, allocator_environment};
+    use super::{LaneConfig, WorkerProcessArgs, allocator_environment};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
+
+    #[test]
+    fn launch_descriptor_preserves_the_selected_grid_attention_provider() {
+        let mut args = WorkerProcessArgs::default();
+        assert_eq!(args.grid_attention_backend, "auto");
+        for provider in ["auto", "torch", "flash_attn_4", "flash_attn_4_sm100"] {
+            args.grid_attention_backend = provider.to_owned();
+            let descriptor = args
+                .launch_descriptor(0, "127.0.0.1:1234", None, None, None)
+                .unwrap();
+            assert_eq!(descriptor["grid_attention_backend"], provider);
+        }
+    }
+
+    #[test]
+    fn launch_descriptor_rejects_unknown_grid_attention_providers() {
+        let args = WorkerProcessArgs {
+            grid_attention_backend: "unknown".into(),
+            ..Default::default()
+        };
+        let error = args
+            .launch_descriptor(0, "127.0.0.1:1234", None, None, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("grid attention backend"));
+    }
+
+    #[test]
+    fn launch_descriptor_preserves_the_selected_matmul_provider() {
+        let mut args = WorkerProcessArgs::default();
+        assert_eq!(args.matmul_backend, "auto");
+        for provider in ["auto", "torch", "cublas", "flashinfer"] {
+            args.matmul_backend = provider.to_owned();
+            let descriptor = args
+                .launch_descriptor(0, "127.0.0.1:1234", None, None, None)
+                .unwrap();
+            assert_eq!(descriptor["matmul_backend"], provider);
+        }
+    }
+
+    #[test]
+    fn launch_descriptor_preserves_attention_overrides() {
+        let mut args = WorkerProcessArgs::default();
+        args.attention_overrides.insert(
+            "transformer.network.blocks.0.cam_self_attn.attn".into(),
+            "flash_attn_4".into(),
+        );
+        let descriptor = args
+            .launch_descriptor(0, "127.0.0.1:1234", None, None, None)
+            .unwrap();
+        assert_eq!(
+            descriptor["attention_overrides"]["transformer.network.blocks.0.cam_self_attn.attn"],
+            "flash_attn_4"
+        );
+    }
 
     /// `--lane` accepts only the fields the worker applies, so a misspelled
     /// optional limit fails at argument parsing instead of leaving the lane

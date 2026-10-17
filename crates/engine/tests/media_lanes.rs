@@ -227,6 +227,7 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
         audio_shift: 3.0,
         frame_rate: 24,
         audio_sample_rate: 32_000,
+        camera_layout: None,
         frames: uniserve_worker_ipc::FrameClips {
             min_frames: 22,
             clip_frames: 17,
@@ -261,6 +262,8 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
 /// A `t2va` request decoded in `video_units` media units.
 fn video_request(id: u64, video_units: u32) -> Request {
     Request::Diffusion(DiffusionRequest {
+        camera: None,
+        camera_media: None,
         request_id: RequestId(id),
         task: VideoTask::T2va,
         prompt_token_ids: PROMPT.to_vec(),
@@ -399,6 +402,8 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
     let handle = EngineHandle::new(tx);
     let mut stream = handle
         .submit(Request::Diffusion(DiffusionRequest {
+            camera: None,
+            camera_media: None,
             request_id: RequestId(90),
             task: VideoTask::T2va,
             prompt_token_ids: PROMPT.to_vec(),
@@ -921,6 +926,8 @@ fn reference_request(id: u64, media: &Arc<MediaSource>) -> Request {
     // then the prompt.
     let text_tags = [vec![1; 3], vec![0; 4], vec![1; 2], vec![0; 8], vec![1; 3]].concat();
     Request::Diffusion(DiffusionRequest {
+        camera: None,
+        camera_media: None,
         request_id: RequestId(id),
         task: VideoTask::Ref2va,
         prompt_token_ids: (0..text_tags.len() as u32).collect(),

@@ -20,6 +20,21 @@ from uniserve.nn.attention.inputs import (
 from uniserve.quantization import QuantizedTensor
 from uniserve.tensors import BufferConfig
 
+BACKENDS = frozenset(
+    {
+        "auto",
+        "torch",
+        "torch_fused",
+        "flash_attn",
+        "flash_attn_4",
+        "flash_attn_4_sm100",
+        "flashinfer",
+        "trtllm",
+        "sgl_kernel",
+        "prefix_block",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class CachePages:
@@ -384,15 +399,7 @@ def resolve(
 
         return _Auto(device, flashinfer=flashinfer)
 
-    if backend not in {
-        "torch",
-        "flash_attn",
-        "flash_attn_4",
-        "flashinfer",
-        "trtllm",
-        "sgl_kernel",
-        "prefix_block",
-    }:
+    if backend not in BACKENDS:
         raise ValueError(f"unknown attention backend {backend!r}")
 
     if backend == "flashinfer" and flashinfer is not None:

@@ -31,7 +31,7 @@ __all__ = [
     "require_media_codecs",
 ]
 
-# The encoders every served container uses.
+# The encoders used by served video and audio tracks.
 VIDEO_CODEC = "libx264"
 AUDIO_CODEC = "aac"
 
@@ -76,10 +76,11 @@ def encoded_video_bytes(frames: int, height: int, width: int) -> int:
     )
 
 
-def require_media_codecs(video_codec: str, audio_codec: str) -> None:
+def require_media_codecs(video_codec: str, audio_codec: str | None) -> None:
     """Verify that the configured encoders are available through PyAV.
 
-    Both codec names must be listed by PyAV and open as an encoder context.
+    Each configured codec must be listed by PyAV and open as an encoder
+    context. ``audio_codec=None`` selects video-only output.
 
     Raises:
         RuntimeError: When PyAV is not installed or does not list a codec.
@@ -90,24 +91,27 @@ def require_media_codecs(video_codec: str, audio_codec: str) -> None:
         import av
     except ImportError as error:
         raise RuntimeError("media output requires the PyAV runtime") from error
-    missing = [
-        name
-        for name in (video_codec, audio_codec)
-        if name not in av.codecs_available
-    ]
+    codecs = (
+        (video_codec,) if audio_codec is None else (video_codec, audio_codec)
+    )
+    missing = [name for name in codecs if name not in av.codecs_available]
     if missing:
         raise RuntimeError(
             "media output requires the codecs "
             + ", ".join(missing)
             + " which this PyAV runtime does not provide"
         )
-    for name in (video_codec, audio_codec):
+    for name in codecs:
         av.CodecContext.create(name, "w")
 
 
 @dataclass(frozen=True, slots=True)
 class AvMuxConfig:
-    """Codec, frame, audio, and media unit settings for one media container."""
+    """Codec, frame, audio, and media unit settings for one media container.
+
+    ``audio_rate=0`` declares a video-only container, with no audio stream.
+    A positive rate requires a separately encoded audio track.
+    """
 
     width: int
     height: int
@@ -120,7 +124,7 @@ class AvMuxConfig:
     audio_frame_samples: int = 1024
 
     def __post_init__(self) -> None:
-        """Validate positive media dimensions.
+        """Validate positive video dimensions and a nonnegative audio rate.
 
         Also validate complete media unit coverage.
         """
@@ -130,11 +134,12 @@ class AvMuxConfig:
                 self.height,
                 self.frame_count,
                 self.frame_rate,
-                self.audio_rate,
             )
             < 1
         ):
             raise ValueError("media mux dimensions and rates must be positive")
+        if self.audio_rate < 0:
+            raise ValueError("media mux audio rate must be nonnegative")
         if (
             not self.video_unit_frames
             or sum(self.video_unit_frames) != self.frame_count
@@ -203,12 +208,15 @@ def encode_audio_track(config: AvMuxConfig, pcm: np.ndarray) -> bytes:
     size when the track does not fill it.
 
     Raises:
-        ValueError: When ``pcm`` is not a ``[samples, 2]`` array, or
+        ValueError: When the container has no audio track, ``pcm`` is not a
+            ``[samples, 2]`` array, or
             ``config.audio_codec`` is not an audio encoder. PyAV raises its
             own errors for codec and encoding failures.
     """
     import av
 
+    if config.audio_rate == 0:
+        raise ValueError("video-only media has no audio track")
     if pcm.ndim != 2 or pcm.shape[1] != 2:
         raise ValueError("audio capture has invalid stereo dimensions")
     target = round(config.frame_count * config.audio_rate / config.frame_rate)
@@ -251,12 +259,12 @@ def encode_audio_track(config: AvMuxConfig, pcm: np.ndarray) -> bytes:
 
 
 class AvMuxSession:
-    """Assembles encoded media units and an encoded audio track into one MP4.
+    """Assembles encoded media units and optional encoded audio into one MP4.
 
-    Both tracks arrive already encoded, so assembly creates each output stream
+    Tracks arrive already encoded, so assembly creates each output stream
     from a template and copies packets across with a running timestamp
     offset; no frame is decoded or re-encoded. Media units are appended as
-    their rounds complete, and the audio track is muxed when the artifact is
+    their rounds complete, and any audio track is muxed when the artifact is
     finalized, so the container is open from the first unit to the last.
     """
 
@@ -278,13 +286,13 @@ class AvMuxSession:
         return len(self.config.video_unit_frames)
 
     def _open(self, first_unit: bytes) -> None:
-        """Create the container and both output streams before any packet.
+        """Create the container and its output streams before any packet.
 
-        The video stream is templated from the first unit. The audio stream
-        must exist before the header is written, and the audio track is not
-        encoded until every unit has been reconstructed, so its template is a
-        brief silent track encoded under the same settings, whose codec
-        parameters are the ones the real track carries.
+        The video stream is templated from the first unit. When configured,
+        the audio stream must exist before the header is written, and the
+        audio track is not encoded until every unit has been reconstructed,
+        so its template is a brief silent track encoded under the same
+        settings, whose codec parameters are the ones the real track carries.
         """
         import av
 
@@ -297,6 +305,8 @@ class AvMuxSession:
             )
         finally:
             source.close()
+        if self.config.audio_rate == 0:
+            return
         template = encode_audio_track(
             replace(self.config, frame_count=1, video_unit_frames=(1,)),
             np.zeros((1, 2), dtype=np.int16),
@@ -347,15 +357,16 @@ class AvMuxSession:
                 source.close()
             self.units_appended += 1
 
-    def finalize(self, audio: bytes) -> bytes:
-        """Mux the audio track after every unit and return the artifact.
+    def finalize(self, audio: bytes | None = None) -> bytes:
+        """Mux any configured audio after every unit and return the artifact.
 
         The session is closed once its container is finalized, so a later
-        call raises.
+        call raises. Video-only sessions require ``audio=None``; sessions
+        with a positive audio rate require an encoded audio track.
 
         Raises:
-            ValueError: When not every media unit has been appended, or the
-                session was closed.
+            ValueError: When not every media unit has been appended, the
+                session was closed, or audio does not match the configuration.
             RuntimeError: When the finished container is empty.
         """
         import av
@@ -364,17 +375,22 @@ class AvMuxSession:
             raise ValueError(
                 "artifact assembly requires every media unit of the request"
             )
-        # The audio track starts at time zero, as the first unit does, so
-        # its packets are copied without an offset.
-        track = av.open(io.BytesIO(audio), mode="r")
-        try:
-            for packet in track.demux(track.streams.audio[0]):
-                if packet.dts is None:
-                    continue
-                packet.stream = self._audio_out
-                self._container.mux(packet)
-        finally:
-            track.close()
+        if self.config.audio_rate > 0:
+            if audio is None:
+                raise ValueError("artifact assembly has no encoded audio")
+            # The audio track starts at time zero, as the first unit does,
+            # so its packets are copied without an offset.
+            track = av.open(io.BytesIO(audio), mode="r")
+            try:
+                for packet in track.demux(track.streams.audio[0]):
+                    if packet.dts is None:
+                        continue
+                    packet.stream = self._audio_out
+                    self._container.mux(packet)
+            finally:
+                track.close()
+        elif audio is not None:
+            raise ValueError("video-only media has no audio track")
         self._container.close()
         assert self._buffer is not None
         value = self._buffer.getvalue()

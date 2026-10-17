@@ -22,4 +22,6 @@ pub use common::{
     ToolChoiceValue, TopLogProb, Usage,
 };
 pub use images::{GeneratedImageData, ImageGenerationRequest, ImageGenerationResponse};
-pub use videos::{DEFAULT_VIDEO_SEED, VideoCondition, VideoGenerationRequest, VideoTarget};
+pub use videos::{
+    CameraCondition, DEFAULT_VIDEO_SEED, VideoCondition, VideoGenerationRequest, VideoTarget,
+};

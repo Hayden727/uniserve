@@ -10,7 +10,7 @@ use serde::Deserialize;
 use validator::Validate;
 
 use super::common::Normalizable;
-use uniserve_core::VideoTask;
+use uniserve_core::{CameraGrid, VideoTask};
 
 use crate::serving::video::plan::{ConditionRole, ConditionType};
 
@@ -55,6 +55,21 @@ pub struct VideoTarget {
     pub duration_seconds: Option<f64>,
 }
 
+/// Immutable camera conditions and clean input in a safetensors archive.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CameraCondition {
+    /// Archive location under the deployment's media access policy.
+    pub uri: String,
+    /// The generated latent's camera and temporal axes.
+    pub grid: CameraGrid,
+    /// Flattened cells held equal to the clean input throughout sampling.
+    pub clean_cells: Vec<u32>,
+    /// Include an MP4 preview in the native latent result bundle.
+    #[serde(default)]
+    pub include_video: bool,
+}
+
 /// MiniMax-H3 video-and-audio generation request for the `/v1/videos`
 /// routes. The served checkpoint fixes the schedule, and every request
 /// generates one video.
@@ -70,6 +85,9 @@ pub struct VideoGenerationRequest {
     /// The task's conditions, in request order.
     #[serde(default)]
     pub conditions: Vec<VideoCondition>,
+    /// Required by `camera2v`; its archive preserves camera and clean tensors.
+    #[serde(default)]
+    pub camera: Option<CameraCondition>,
     /// The requested output.
     pub target: VideoTarget,
     /// Video-generation random seed.

@@ -58,6 +58,8 @@ pub enum RequestField {
     Task,
     /// `prompt`.
     Prompt,
+    /// Camera tensor archive and grid dimensions.
+    Camera,
     /// `target.short_edge`.
     TargetShortEdge,
     /// `target.aspect_ratio`.
@@ -77,6 +79,7 @@ impl RequestField {
         match self {
             Self::Task => "task",
             Self::Prompt => "prompt",
+            Self::Camera => "camera",
             Self::TargetShortEdge => "target.short_edge",
             Self::TargetAspectRatio => "target.aspect_ratio",
             Self::TargetDuration => "target.duration_seconds",
@@ -196,7 +199,7 @@ pub struct ProcessedVideoRequest {
 pub struct VideoProcessor {
     fetcher: MediaFetcher,
     prober: MediaProber,
-    vision: ProcessorConfig,
+    vision: Option<ProcessorConfig>,
     limits: PlanLimits,
     tokenizer: DynTokenizer,
 }
@@ -207,14 +210,14 @@ impl VideoProcessor {
     pub fn new(
         fetcher: MediaFetcher,
         prober: MediaProber,
-        vision: ProcessorConfig,
+        vision: impl Into<Option<ProcessorConfig>>,
         limits: PlanLimits,
         tokenizer: DynTokenizer,
     ) -> Self {
         Self {
             fetcher,
             prober,
-            vision,
+            vision: vision.into(),
             limits,
             tokenizer,
         }
@@ -223,6 +226,23 @@ impl VideoProcessor {
     /// What the deployment serves, which every request is planned against.
     pub fn limits(&self) -> &PlanLimits {
         &self.limits
+    }
+
+    /// Resolves a camera archive under the same bounded media policy.
+    pub async fn fetch_camera(&self, uri: &str) -> Result<FetchedMedia, VideoInputError> {
+        let mut fetched = self
+            .fetcher
+            .fetch_all(&[uri])
+            .await
+            .map_err(|error| match error {
+                VideoInputError::Invalid { message, .. } => {
+                    VideoInputError::invalid(RequestField::Camera, message)
+                }
+                internal => internal,
+            })?;
+        fetched
+            .pop()
+            .ok_or_else(|| VideoInputError::internal("camera fetch returned no archive"))
     }
 
     /// Validates, fetches, probes, plans and presents one request.
@@ -265,7 +285,7 @@ impl VideoProcessor {
             &request.target,
             &specs,
             &probes,
-            &self.vision,
+            self.vision.as_ref(),
             &self.limits,
         )?;
         let presentation = presentation::present(&self.tokenizer, &plan, request.prompt)?;

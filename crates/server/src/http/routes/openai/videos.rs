@@ -98,6 +98,12 @@ pub(crate) async fn videos_sync(
             "server-timing",
             format!("generation;dur={generation_ms:.1}"),
         );
+    if artifact.content_type == "application/zip" {
+        response = response.header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"camera-result.zip\"",
+        );
+    }
     if let Some(timing) = clock.finish() {
         response = response
             .header(
@@ -143,7 +149,7 @@ enum PartKind {
 fn part_kind(name: &str) -> Option<PartKind> {
     Some(match name {
         "model" | "prompt" | "task" => PartKind::Text,
-        "conditions" | "target" => PartKind::Json,
+        "conditions" | "target" | "camera" => PartKind::Json,
         "seed" => PartKind::Unsigned,
         _ => return None,
     })
@@ -357,9 +363,7 @@ pub(crate) async fn videos_create(
                     _ => {}
                 }
                 if let ControlFlow::Break(outcome) = collector.push(event) {
-                    return outcome
-                        .map(|artifact| artifact.media)
-                        .map_err(job_failure);
+                    return outcome.map_err(job_failure);
                 }
             }
         }
@@ -540,7 +544,7 @@ pub(crate) async fn videos_delete(
     }
 }
 
-/// Streams a completed job's video as `video/mp4`.
+/// Streams a completed job's artifact with its original content type.
 ///
 /// Answers `409 Conflict` for a job without content (queued, running, or
 /// failed) and `404 Not Found` for an unknown id. The response body holds the
@@ -559,14 +563,19 @@ pub(crate) async fn videos_content(
         };
     };
     let length = media.len();
-    (
-        [
-            (header::CONTENT_TYPE, "video/mp4".to_owned()),
-            (header::CONTENT_LENGTH, length.to_string()),
-        ],
-        media_body(media),
-    )
-        .into_response()
+    let mut response = Response::builder()
+        .header(header::CONTENT_TYPE, &media.content_type)
+        .header(header::CONTENT_LENGTH, length);
+    if media.content_type == "application/zip" {
+        response = response.header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"camera-result.zip\"",
+        );
+    }
+    response.body(media_body(media)).unwrap_or_else(|error| {
+        ApiError::server_error(format!("failed to construct media response: {error}"))
+            .into_response()
+    })
 }
 
 /// Streams `media` as a body of copied chunks of at most 64 KiB.
@@ -716,6 +725,28 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(defaulted.seed, crate::openai::DEFAULT_VIDEO_SEED);
+    }
+
+    #[tokio::test]
+    async fn camera_output_defaults_to_native_latents_and_accepts_a_preview() {
+        let mut body = video_request();
+        body["task"] = serde_json::json!("camera2v");
+        body["camera"] = serde_json::json!({
+            "uri": "data:application/octet-stream;base64,AA==",
+            "grid": {"views": 12, "columns": 4, "order": "view_major"},
+            "clean_cells": [0],
+        });
+        let request = VideoBody::from_request(json_request(&body), &())
+            .await
+            .unwrap()
+            .0;
+        assert!(!request.camera.unwrap().include_video);
+        body["camera"]["include_video"] = serde_json::json!(true);
+        let request = VideoBody::from_request(json_request(&body), &())
+            .await
+            .unwrap()
+            .0;
+        assert!(request.camera.unwrap().include_video);
     }
 
     /// Fields outside the schema, a schedule field included, and file parts

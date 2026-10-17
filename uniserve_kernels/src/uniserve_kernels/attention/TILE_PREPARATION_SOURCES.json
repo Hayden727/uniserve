@@ -1,0 +1,15 @@
+{
+  "format": "uniserve.tile-preparation-sources.1",
+  "destination": "tile_rope_pool.py",
+  "origin": "Impossible research/core/kernels/vsa_tile_rope_pool_fused.py",
+  "sha256": "425cdf302934ccc40210860cb3f53a47e4e132e4636b11a88d3c6908d70621b9",
+  "bytes": 15099,
+  "provenance": "Authorized internal numerical mechanism transfer; original source has no standalone license notice. Imported Triton remains an external dependency.",
+  "retained_kernels": ["_rope_pair", "_tile_rope_pool_fwd"],
+  "adaptations": [
+    "Runtime-owned destinations and index storage",
+    "Full-lane rotary tables, with no pointer cache or device-to-host duplicate probe",
+    "Forward-only BF16 SHD128 inference entrypoint; BT64, four warps",
+    "No original framework imports or autograd wrapper"
+  ]
+}

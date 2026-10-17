@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use uniserve_core::{
-    Canvas, DiffusionRequest, DiffusionSamplingParams, MediaSource, RequestId, VideoTask,
+    CameraInput, Canvas, DiffusionRequest, DiffusionSamplingParams, MediaSource, RequestId,
+    VideoTask,
 };
 use uniserve_engine::VideoDenoiserInfo;
 
@@ -32,8 +33,15 @@ use crate::profile::tokenizer::DynTokenizer;
 use crate::serving::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, ServeError, ServeRequestId};
 
 /// The fields of the video request body, in schema order.
-pub(crate) const REQUEST_FIELDS: [&str; 6] =
-    ["model", "prompt", "task", "conditions", "target", "seed"];
+pub(crate) const REQUEST_FIELDS: [&str; 7] = [
+    "model",
+    "prompt",
+    "task",
+    "conditions",
+    "camera",
+    "target",
+    "seed",
+];
 
 /// A video request ready for submission.
 #[derive(Debug, Clone, PartialEq)]
@@ -76,7 +84,7 @@ impl VideoService {
     /// is invalid, or when the media fetcher cannot be built.
     pub fn new(
         denoiser: VideoDenoiserInfo,
-        vision: ProcessorConfig,
+        vision: impl Into<Option<ProcessorConfig>>,
         max_video_seconds: f64,
         latent_encoding_lane: u32,
         media: &VideoMediaSettings,
@@ -99,6 +107,18 @@ impl VideoService {
                     .ok_or_else(|| anyhow::anyhow!("the worker serves unknown video task {name:?}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        // Camera outputs may concatenate many views into one artifact. Their
+        // deployment capacity follows that complete output, while the ordinary
+        // video API retains its 15-second model limit.
+        anyhow::ensure!(
+            max_video_seconds.is_finite() && max_video_seconds >= MIN_VIDEO_SECONDS,
+            "video capacity must be finite and at least {MIN_VIDEO_SECONDS} seconds"
+        );
+        anyhow::ensure!(
+            tasks.iter().all(|task| *task == VideoTask::Camera2v)
+                || max_video_seconds <= MAX_VIDEO_SECONDS,
+            "ordinary video capacity cannot exceed {MAX_VIDEO_SECONDS} seconds"
+        );
         let fetcher = MediaFetcher::new(MediaPolicy {
             media_directory: media.media_directory.clone(),
             remote: RemoteMediaPolicy {
@@ -170,6 +190,7 @@ impl VideoService {
             .map(|task| {
                 let rules = match task {
                     VideoTask::T2va => json!({"conditions": []}),
+                    VideoTask::Camera2v => json!({"conditions": [], "camera": "required"}),
                     VideoTask::Fl2va => json!({
                         "keyframe_frame_indices": [[0], [-1], [0, -1]],
                         "aspect_ratio": "auto or W:H",
@@ -201,9 +222,18 @@ impl VideoService {
             "fps": self.denoiser.frame_rate,
             "audio_sample_rate": self.denoiser.audio_sample_rate,
             "frames": self.denoiser.frames,
+            "camera_layout": self.denoiser.camera_layout,
             "min_seconds": MIN_VIDEO_SECONDS,
             "max_seconds": self.processor.limits().max_video_seconds,
-            "model_max_seconds": MAX_VIDEO_SECONDS,
+            "model_max_seconds": self.denoiser.camera_layout.map_or_else(|| {
+                if self.tasks.iter().all(|task| *task == VideoTask::Camera2v) {
+                    self.processor.limits().max_video_seconds
+                } else {
+                    MAX_VIDEO_SECONDS
+                }
+            }, |layout| {
+                f64::from(layout.views * layout.frames_per_view) / f64::from(self.denoiser.frame_rate)
+            }),
             "schedule": {
                 "num_inference_steps": self.denoiser.schedule_points,
                 "flow_shift": self.denoiser.video_shift,
@@ -237,6 +267,28 @@ impl VideoService {
         request: &VideoGenerationRequest,
         max_prompt_tokens: u32,
     ) -> Result<ProcessedVideo, ApiError> {
+        if (request.task == VideoTask::Camera2v) != request.camera.is_some() {
+            return Err(ApiError::invalid_request(
+                "camera2v requires camera input, and other tasks do not accept it",
+                Some("camera"),
+            ));
+        }
+        if let Some(camera) = &request.camera {
+            camera
+                .grid
+                .validate_clean_cells(&camera.clean_cells)
+                .map_err(|error| ApiError::invalid_request(error, Some("camera")))?;
+            if let Some(layout) = self.denoiser.camera_layout
+                && (camera.grid.views != layout.views
+                    || camera.grid.columns != layout.columns
+                    || camera.grid.order != layout.order)
+            {
+                return Err(ApiError::invalid_request(
+                    "camera grid views, columns and order must match the served camera layout",
+                    Some("camera.grid"),
+                ));
+            }
+        }
         let conditions: Vec<ConditionInput<'_>> =
             request.conditions.iter().map(condition_input).collect();
         let processed = self
@@ -253,6 +305,23 @@ impl VideoService {
             })
             .await?;
         let plan = &processed.plan;
+        if let Some(camera) = &request.camera {
+            if let Some(layout) = self.denoiser.camera_layout {
+                if plan.num_frames != layout.views * layout.frames_per_view {
+                    return Err(ApiError::invalid_request(
+                        "generated frame count must match the served camera layout",
+                        Some("target.duration_seconds"),
+                    ));
+                }
+            } else if camera.grid.views * camera.grid.columns
+                != self.denoiser.frames.latent_frames(plan.num_frames)
+            {
+                return Err(ApiError::invalid_request(
+                    "camera grid cells must match the generated latent frames",
+                    Some("camera"),
+                ));
+            }
+        }
         let prompt_token_ids = processed.presentation.token_ids;
         if prompt_token_ids.len() > max_prompt_tokens as usize {
             return Err(crate::openai::serve_error_to_api(
@@ -284,8 +353,28 @@ impl VideoService {
             conditions.push(condition.describe(plan.canvas, source.locator(), bands));
             media.push(Arc::new(source));
         }
+        let (camera, camera_media) = if let Some(input) = &request.camera {
+            let fetched = self.processor.fetch_camera(&input.uri).await?;
+            let source = Arc::new(MediaSource::publish(fetched.bytes()).map_err(|error| {
+                ApiError::server_error(format!("publishing camera input failed: {error}"))
+            })?);
+            let camera = CameraInput {
+                source: source.locator(),
+                grid: input.grid,
+                clean_cells: input.clean_cells.clone(),
+                include_video: input.include_video,
+            };
+            camera
+                .validate()
+                .map_err(|error| ApiError::invalid_request(error, Some("camera")))?;
+            (Some(Box::new(camera)), Some(source))
+        } else {
+            (None, None)
+        };
         Ok(ProcessedVideo {
             request: DiffusionRequest {
+                camera,
+                camera_media,
                 request_id: RequestId::default(),
                 task: plan.task,
                 prompt_token_ids,
@@ -344,6 +433,14 @@ mod tests {
     /// `latent_encoding_lane` condition units in one round, in a deployment
     /// that sizes references as `references` states.
     fn service(latent_encoding_lane: u32, references: ReferenceConfig) -> VideoService {
+        service_with_capacity(latent_encoding_lane, references, 15.0).unwrap()
+    }
+
+    fn service_with_capacity(
+        latent_encoding_lane: u32,
+        references: ReferenceConfig,
+        max_video_seconds: f64,
+    ) -> anyhow::Result<VideoService> {
         VideoService::new(
             VideoDenoiserInfo {
                 tasks: ["t2va", "fl2va", "ref2va"].map(str::to_owned).to_vec(),
@@ -352,6 +449,7 @@ mod tests {
                 audio_shift: 3.0,
                 frame_rate: 24,
                 audio_sample_rate: 32_000,
+                camera_layout: None,
                 frames: uniserve_engine::FrameClips {
                     min_frames: 22,
                     clip_frames: 17,
@@ -367,13 +465,23 @@ mod tests {
                 },
             },
             vision(&fixture()),
-            15.0,
+            max_video_seconds,
             latent_encoding_lane,
             &VideoMediaSettings::default(),
             references,
             Arc::new(character_tokenizer()),
         )
-        .unwrap()
+    }
+
+    #[test]
+    fn ordinary_video_capacity_retains_its_duration_limit() {
+        for (seconds, valid) in [(4.0, true), (15.0, true), (15.5, false), (228.0, false)] {
+            assert_eq!(
+                service_with_capacity(1, ReferenceConfig::default(), seconds).is_ok(),
+                valid,
+                "{seconds} seconds"
+            );
+        }
     }
 
     fn png(width: u32, height: u32) -> Vec<u8> {

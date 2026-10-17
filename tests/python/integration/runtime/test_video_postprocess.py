@@ -7,14 +7,14 @@ import pytest
 import torch
 
 from uniserve.media import image, video
-from uniserve.model.video import VideoPostprocessor
+from uniserve.model.video import OverlapPostprocessor
 from uniserve.runtime import CUDAGraph, ExecutionContext
 from uniserve.tensors import OutputLayout, TensorOutput
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
-class Reconstruction(VideoPostprocessor):
+class Reconstruction(OverlapPostprocessor):
     def reconstruction_slices(self, clip, num_frames):
         return slice(0, 3), slice(4, 6)
 

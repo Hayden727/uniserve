@@ -21,7 +21,10 @@ from uniserve.nn.attention._parallel import (
     AttentionBuffers,
     ParallelAttention,
 )
+from uniserve.nn.attention.grid import GridAttention
 from uniserve.nn.attention.vsa import BlockAttention
+from uniserve.nn.attention.vsa.tiles import TileAttention
+from uniserve.nn.convolution import Conv2d, Conv3d
 from uniserve.nn.linear import (
     ColumnParallelLinear,
     Linear,
@@ -32,8 +35,11 @@ from uniserve.runtime._collectives import GatherPool
 from uniserve.runtime.communication import stream_collective_scope
 from uniserve.tensors import BufferConfig
 
+from .backends.attention import BACKENDS
 from .bindings import capturing
 from .bindings.attention import AttentionBinding, ExchangeBuffers
+from .bindings.convolution import ConvolutionBinding, ConvPlan
+from .bindings.grid import GridBinding
 from .bindings.matmul import MatmulBinding
 from .bindings.moe import MoEBinding
 from .bindings.vsa import VsaBinding
@@ -42,6 +48,7 @@ from .stream import CUDAStream
 from .tensor_buffers import TensorBuffers
 
 if TYPE_CHECKING:
+    from .backends.attention import Backend as AttentionBackend
     from .backends.attention.vsa import Operator as VsaOperator
 
 SizeT = TypeVar("SizeT")
@@ -165,6 +172,16 @@ class ExecutionContext(Generic[SizeT]):
     replay of a graph captured at the tile shape; the encoders' calls within
     this context encode their tiles through them. Their owner keeps them
     valid for this context's lifetime.
+
+    ``attention_overrides`` selects a provider for individual Attention
+    modules below ``module``. Unlisted layers use ``attention``. Selection
+    belongs to this context and never changes the numerical module, so
+    independent contexts can evaluate the same model with different providers.
+
+    ``grid`` selects exact grid-attention dense segments independently of
+    ordinary attention: ``auto`` uses fused FA4 on CUDA and a bounded CPU
+    reference. Grid bindings borrow this context's serialized scratch and
+    specialize during warmup before graph capture.
     """
 
     def __init__(
@@ -174,9 +191,13 @@ class ExecutionContext(Generic[SizeT]):
         stream: CUDAStream | None = None,
         cache=None,
         attention="auto",
+        attention_overrides: Mapping[Attention, str | AttentionBackend]
+        | None = None,
         vsa="auto",
+        grid="auto",
         matmul="auto",
         moe="auto",
+        convolution: tuple[ConvPlan, ...] | None = None,
         groups=None,
         scratch: Scratch | None = None,
         derive_host_lengths: bool = True,
@@ -197,6 +218,21 @@ class ExecutionContext(Generic[SizeT]):
             matmul,
         )
         self._moe_backend = moe
+        if grid not in ("auto", "torch", "flash_attn_4", "flash_attn_4_sm100"):
+            raise ValueError(f"unknown grid attention backend {grid!r}")
+        self._grid_backend = grid
+        descendants = {id(child) for child in module.modules()}
+        self._attention_overrides = {}
+        for layer, backend in (attention_overrides or {}).items():
+            if not isinstance(layer, Attention) or id(layer) not in descendants:
+                raise ValueError(
+                    "attention overrides must name Attention modules "
+                    "within the execution root"
+                )
+            if isinstance(backend, str) and backend not in BACKENDS:
+                raise ValueError(f"unknown attention backend {backend!r}")
+            self._attention_overrides[id(layer)] = backend
+        self._convolution_plans = convolution
         self._derive_host_lengths = derive_host_lengths
         self.experts = experts
         # Borrowed immutable expert storage and local prefetch scheduling.
@@ -249,6 +285,7 @@ class ExecutionContext(Generic[SizeT]):
         self._merged: dict[int | _binding.MergedKey, MatmulBinding] = {}
         self._attention: dict[int, AttentionBinding] = {}
         self._vsa: dict[int, VsaBinding] = {}
+        self._grid: dict[int, GridBinding] = {}
         # VSA plans depend on numerical shapes, not on layer weights. Keep
         # one operator per signature across this context's serialized layers,
         # with the name of the provider that prepared it.
@@ -256,6 +293,7 @@ class ExecutionContext(Generic[SizeT]):
             tuple[object, ...], tuple[str, VsaOperator]
         ] = {}
         self._moe: dict[int, MoEBinding] = {}
+        self._convolution: dict[int, ConvolutionBinding] = {}
         self._vsa_context: dict[ParallelAttention, AttentionBuffers] = {}
         self._context_backing: dict[tuple[object, ...], AttentionBuffers] = {}
         self._vsa_storage: dict[tuple[object, ...], AttentionBuffers] = {}
@@ -434,6 +472,16 @@ class ExecutionContext(Generic[SizeT]):
                 device, dtype = _representation(child, inherited)
                 representations[path] = device, dtype
 
+                if isinstance(child, (Conv2d, Conv3d)) and (
+                    self._convolution_plans is not None
+                    or getattr(child, "backend", "auto") != "auto"
+                ):
+                    self._convolution[id(child)] = ConvolutionBinding(
+                        child,
+                        self._convolution_plans,
+                        partial(self.scratch, "convolution"),
+                    )
+
                 if isinstance(child, (Linear, MergedColumnParallelLinear)):
                     binding = MatmulBinding(
                         child,
@@ -518,13 +566,18 @@ class ExecutionContext(Generic[SizeT]):
                     if isinstance(size, TextSize):
                         moe_binding.prepare(size)
 
-                if isinstance(child, BlockAttention):
+                if isinstance(child, (BlockAttention, TileAttention)):
                     self._vsa[id(child)] = VsaBinding(
                         self._vsa_backend,
                         self.scratch,
                         self._attention_workspace,
                         self._vsa_exchange,
                         self._vsa_operators,
+                    )
+
+                if isinstance(child, GridAttention):
+                    self._grid[id(child)] = GridBinding(
+                        child, self._grid_backend, self.scratch
                     )
 
                 if isinstance(child, Attention):
@@ -536,7 +589,9 @@ class ExecutionContext(Generic[SizeT]):
 
                     attention_binding = AttentionBinding(
                         child,
-                        self._attention_backend,
+                        self._attention_overrides.get(
+                            id(child), self._attention_backend
+                        ),
                         state,
                         size if isinstance(size, TextSize) else None,
                         device,
@@ -724,7 +779,7 @@ class ExecutionContext(Generic[SizeT]):
         Returns one record per call site and prepared representation, in
         module order. Each record holds ``path``, the call site's module path
         within the prepared module, and ``op``: ``attention``, ``vsa``,
-        ``moe`` or ``matmul``. The rest describes the call site's
+        ``grid``, ``moe`` or ``matmul``. The rest describes the call site's
         representation and the ``provider`` its binding resolved; automatic
         attention selection also reports, under ``inputs``, the provider
         that served each input class the call site met. Call sites prepare
@@ -746,7 +801,9 @@ class ExecutionContext(Generic[SizeT]):
                 else self._operators.get(id(child)),
                 self._moe.get(id(child)),
                 self._vsa.get(id(child)),
+                self._grid.get(id(child)),
                 self._attention.get(id(child)),
+                self._convolution.get(id(child)),
             )
             for binding in bindings:
                 if binding is not None:
@@ -780,10 +837,12 @@ class ExecutionContext(Generic[SizeT]):
             _install(scope, _binding.merged_matmul, self._merged)
             _install(scope, _binding.attention, self._attention)
             _install(scope, _binding.vsa, self._vsa)
+            _install(scope, _binding.grid, self._grid)
             _install(scope, _binding.moe, self._moe)
             _install(scope, _binding.attention_storage, self._exchange)
             _install(scope, _binding.linear_chunks, self._chunks)
             _install(scope, _binding.tile_operators, self._tiles)
+            _install(scope, _binding.convolution, self._convolution)
             if self.weights is not None:
                 scope.enter_context(self.weights.activate())
             yield
@@ -799,11 +858,13 @@ class ExecutionContext(Generic[SizeT]):
             close_resources(
                 *(binding.close for binding in self._attention.values()),
                 *(binding.close for binding in self._vsa.values()),
+                *(binding.close for binding in self._grid.values()),
                 *(
                     operator.close
                     for _, operator in self._vsa_operators.values()
                 ),
                 *(binding.close for binding in self._moe.values()),
+                *(binding.close for binding in self._convolution.values()),
                 *(
                     allocation.close
                     for allocation in reversed(self._allocations)
@@ -821,8 +882,10 @@ class ExecutionContext(Generic[SizeT]):
                 self._merged,
                 self._attention,
                 self._vsa,
+                self._grid,
                 self._vsa_operators,
                 self._moe,
+                self._convolution,
                 self._vsa_context,
                 self._context_backing,
                 self._vsa_storage,

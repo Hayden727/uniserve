@@ -51,6 +51,8 @@ pub enum ModelDescription {
     Bagel,
     /// MiniMax H3 video-generation profile.
     MiniMaxH3,
+    /// Wan camera-conditioned video-generation profile.
+    Wan,
     /// DiffusionGemma block-diffusion profile: System One decision readout
     /// and block-diffusion chat generation.
     DiffusionGemma,
@@ -62,11 +64,12 @@ impl ModelDescription {
     /// `from_model_type` and `from_pipeline_class` search only this list, so a
     /// variant missing from it compiles but is never selected from checkpoint
     /// metadata.
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Qwen3,
         Self::SenseNova,
         Self::Bagel,
         Self::MiniMaxH3,
+        Self::Wan,
         Self::DiffusionGemma,
     ];
 
@@ -77,6 +80,7 @@ impl ModelDescription {
             Self::SenseNova => "sensenova",
             Self::Bagel => "bagel",
             Self::MiniMaxH3 => "minimax_h3",
+            Self::Wan => "wan",
             Self::DiffusionGemma => "diffusion_gemma",
         }
     }
@@ -89,20 +93,21 @@ impl ModelDescription {
             Self::SenseNova => &["neo_chat"],
             Self::Bagel => &["bagel"],
             Self::DiffusionGemma => &["diffusion_gemma"],
-            Self::MiniMaxH3 => &[],
+            Self::MiniMaxH3 | Self::Wan => &[],
         }
     }
 
     /// Returns the pipeline class a family's checkpoint declares in a root
     /// diffusers index.
     ///
-    /// MiniMax H3 ships only as a pipeline. A DiffusionGemma checkpoint
+    /// MiniMax H3 and Wan ship only as pipelines. A DiffusionGemma checkpoint
     /// publishes a `DiffusionGemmaPipeline` index beside its root transformers
     /// `config.json`, which remains the source of its settings (see
     /// [`ModelDescription::is_pipeline`]).
     const fn pipeline_class(self) -> Option<&'static str> {
         match self {
             Self::MiniMaxH3 => Some("MiniMaxH3ModularPipeline"),
+            Self::Wan => Some("WanCameraPipeline"),
             Self::DiffusionGemma => Some("DiffusionGemmaPipeline"),
             Self::Qwen3 | Self::SenseNova | Self::Bagel => None,
         }
@@ -148,6 +153,7 @@ impl std::str::FromStr for ModelDescription {
             "sensenova" => Ok(Self::SenseNova),
             "bagel" => Ok(Self::Bagel),
             "minimax-h3" | "minimax_h3" => Ok(Self::MiniMaxH3),
+            "wan" => Ok(Self::Wan),
             "diffusion-gemma" | "diffusion_gemma" => Ok(Self::DiffusionGemma),
             _ => Err(ModelDescriptionParseError(value.to_owned())),
         }
@@ -191,6 +197,9 @@ pub enum ModelParameters {
     /// handshake reports it, and the duration capacity to the deployment's
     /// engine settings.
     MiniMaxH3,
+    /// Wan camera-conditioned video generation with a UMT5 text encoder.
+    /// Numerical schedules, canvases and camera inputs belong to the worker.
+    Wan,
     /// DiffusionGemma canvas, control-token, image, and sampler settings.
     DiffusionGemma(DiffusionGemmaProfile),
 }
@@ -282,7 +291,7 @@ impl ModelConfig {
             }
             // `from_model_type` resolves only families described by a root
             // configuration; a pipeline family resolves through `from_pipeline`.
-            ModelDescription::MiniMaxH3 => {
+            ModelDescription::MiniMaxH3 | ModelDescription::Wan => {
                 return Err(assets::Error::UnsupportedModelType {
                     actual: actual_model_type.to_owned(),
                 });
@@ -323,6 +332,7 @@ impl ModelConfig {
             // default is the prompt length a deployment prepares layouts and
             // storage for: startup prepares every text capacity up to it.
             ModelDescription::MiniMaxH3 => (ModelParameters::MiniMaxH3, 16_384),
+            ModelDescription::Wan => (ModelParameters::Wan, 512),
             ModelDescription::Qwen3
             | ModelDescription::SenseNova
             | ModelDescription::Bagel
@@ -350,6 +360,7 @@ impl ModelConfig {
             ModelParameters::SenseNova(_) => ModelDescription::SenseNova,
             ModelParameters::Bagel(_) => ModelDescription::Bagel,
             ModelParameters::MiniMaxH3 => ModelDescription::MiniMaxH3,
+            ModelParameters::Wan => ModelDescription::Wan,
             ModelParameters::DiffusionGemma(_) => ModelDescription::DiffusionGemma,
         }
     }
@@ -559,6 +570,9 @@ mod tests {
                 ModelParameters::MiniMaxH3 => {
                     assert_eq!(description, ModelDescription::MiniMaxH3);
                 }
+                ModelParameters::Wan => {
+                    assert_eq!(description, ModelDescription::Wan);
+                }
                 ModelParameters::DiffusionGemma(_) => {
                     assert_eq!(description, ModelDescription::DiffusionGemma);
                 }
@@ -577,6 +591,21 @@ mod tests {
         let profile = ModelConfig::from_pipeline("h3", ModelDescription::MiniMaxH3, None).unwrap();
         assert_eq!(profile.description(), ModelDescription::MiniMaxH3);
         assert_eq!(profile.max_model_len, 16_384);
+    }
+
+    #[test]
+    fn a_wan_camera_pipeline_resolves_its_own_profile_and_prompt_limit() {
+        let description = ModelDescription::from_pipeline_class("WanCameraPipeline").unwrap();
+        assert_eq!(description, ModelDescription::Wan);
+        assert!(description.is_pipeline());
+        assert_eq!("wan".parse::<ModelDescription>().unwrap(), description);
+
+        let profile = ModelConfig::from_pipeline("camera", description, None).unwrap();
+        assert_eq!(profile.description(), ModelDescription::Wan);
+        assert_eq!(profile.served_name, "camera");
+        assert_eq!(profile.max_model_len, 512);
+        let configured = ModelConfig::from_pipeline("camera", description, Some(256)).unwrap();
+        assert_eq!(configured.max_model_len, 256);
     }
 
     /// A Bagel latent position table whose rows do not form a square grid

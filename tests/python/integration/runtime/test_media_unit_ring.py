@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from uniserve.media import image, video
-from uniserve.model import VideoPostprocessor
+from uniserve.model import OverlapPostprocessor
 from uniserve.tensors import OutputLayout, TensorOutput
 
 pytestmark = pytest.mark.integration
@@ -25,7 +25,7 @@ HEIGHT, WIDTH = 2, 3
 FRAME = image.Config(HEIGHT, WIDTH)
 
 
-class _Blend(VideoPostprocessor):
+class _Blend(OverlapPostprocessor):
     """Three body frames and a two-frame successor overlap per clip."""
 
     def reconstruction_slices(self, clip, num_frames):

@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from uniserve.media import image, video
-from uniserve.model import VideoPostprocessor
+from uniserve.model import OverlapPostprocessor
 from uniserve.nn.vae.tiled import TiledDecoder
 from uniserve.tensors import OutputLayout, TensorOutput
 
@@ -16,7 +16,7 @@ pytestmark = pytest.mark.unit
 
 
 def test_video_clips_preserve_pixels_across_separate_calls():
-    class ThreeFrameVideo(VideoPostprocessor):
+    class ThreeFrameVideo(OverlapPostprocessor):
         def reconstruction_slices(self, clip, num_frames):
             return slice(0, 3), slice(4, 6)
 

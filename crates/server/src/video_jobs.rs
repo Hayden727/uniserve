@@ -22,7 +22,7 @@ use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use uniserve_core::SharedMedia;
+use uniserve_core::{ArtifactEvent, SharedMedia};
 
 use crate::config::VideoJobSettings;
 
@@ -111,6 +111,7 @@ struct RetainedJob {
 /// if the job is deleted or expires meanwhile.
 pub(crate) struct RetainedMedia {
     media: Arc<SharedMedia>,
+    pub(crate) content_type: String,
     _bytes: OwnedSemaphorePermit,
 }
 
@@ -223,7 +224,7 @@ impl VideoJobs {
     pub(crate) fn finish(
         self: &Arc<Self>,
         id: &str,
-        result: Result<Arc<SharedMedia>, VideoFailure>,
+        result: Result<ArtifactEvent, VideoFailure>,
         timing: Option<GenerationTiming>,
     ) {
         let mut entries = self.entries();
@@ -231,13 +232,14 @@ impl VideoJobs {
         // `try_acquire_many_owned` takes a `u32` count and does not wait, so an
         // artifact larger than `u32::MAX` bytes and an exhausted budget both
         // fail the job.
-        let result = result.and_then(|media| {
-            let bytes = u32::try_from(media.len())
+        let result = result.and_then(|artifact| {
+            let bytes = u32::try_from(artifact.media.len())
                 .ok()
                 .and_then(|bytes| Arc::clone(&self.bytes).try_acquire_many_owned(bytes).ok());
             match bytes {
                 Some(permit) => Ok(Arc::new(RetainedMedia {
-                    media,
+                    media: artifact.media,
+                    content_type: artifact.content_type,
                     _bytes: permit,
                 })),
                 None => Err(VideoFailure {
@@ -353,6 +355,33 @@ mod tests {
 
     fn store() -> Arc<VideoJobs> {
         Arc::new(VideoJobs::new(VideoJobSettings::default()))
+    }
+
+    #[tokio::test]
+    async fn camera_content_type_and_download_survive_job_deletion() {
+        let jobs = store();
+        jobs.insert(record("camera-a")).unwrap();
+        let source = uniserve_core::MediaSource::publish(b"camera archive bytes").unwrap();
+        let locator = source.locator();
+        // SAFETY: MediaSource publishes immutable bytes; no writer remains.
+        let media = Arc::new(unsafe { SharedMedia::open(&locator.name, locator.bytes) }.unwrap());
+        let weak = Arc::downgrade(&media);
+        jobs.finish(
+            "camera-a",
+            Ok(ArtifactEvent {
+                media_kind: uniserve_core::MediaKind::Video,
+                content_type: "application/zip".into(),
+                media,
+            }),
+            None,
+        );
+        let download = jobs.content("camera-a").unwrap();
+        assert_eq!(download.content_type, "application/zip");
+        assert!(jobs.delete("camera-a"));
+        assert!(jobs.content("camera-a").is_none());
+        assert_eq!(download.as_ref().as_ref(), b"camera archive bytes");
+        drop(download);
+        assert!(weak.upgrade().is_none());
     }
 
     #[tokio::test]

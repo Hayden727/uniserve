@@ -23,6 +23,71 @@ pytestmark = pytest.mark.unit
 @pytest.mark.parametrize(
     "dtype,large", ((torch.float16, 2048), (torch.bfloat16, 256))
 )
+@pytest.mark.parametrize("bias", (False, True))
+@pytest.mark.parametrize("output_dtype", (None, torch.float32))
+@pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda", marks=pytest.mark.gpu))
+)
+@torch.inference_mode()
+def test_projection_can_round_the_product_before_adding_bias(
+    dtype, large, bias, output_dtype, device
+):
+    from uniserve.model import TextSize
+    from uniserve.runtime import ExecutionContext
+
+    layer = Linear(2, 1, bias=bias, device=device, dtype=dtype)
+    layer.weight.copy_(torch.tensor([[large, 1]], device=device, dtype=dtype))
+    if bias:
+        layer.bias.fill_(-large)
+    source = torch.tensor(
+        [[[1, 1], [1, 3]]], device=device, dtype=dtype
+    ).transpose(1, 2)
+    # Source rows are [1, 1] and [1, 3]. At this magnitude the product's
+    # low-precision spacing is two: ties round to large and large + 4.
+    # FP32 output retains both contributions before the bias cancellation.
+    increments = [1, 3] if output_dtype == torch.float32 else [0, 4]
+    expected = torch.tensor(
+        increments,
+        device=device,
+        dtype=output_dtype or dtype,
+    ).reshape(1, 2, 1)
+    if not bias:
+        expected += large
+    fused = torch.tensor(
+        [1, 3] if bias else increments,
+        device=device,
+        dtype=output_dtype or dtype,
+    ).reshape(1, 2, 1)
+    if not bias:
+        fused += large
+
+    with ExecutionContext(layer, matmul="torch") as context:
+        context.prepare(TextSize(2, 1))
+        torch.testing.assert_close(
+            layer(source, output_dtype=output_dtype), fused, rtol=0, atol=0
+        )
+        actual = layer(
+            source, round_before_bias=True, output_dtype=output_dtype
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        out = torch.empty(1, 2, 2, device=device, dtype=output_dtype or dtype)[
+            ..., :1
+        ]
+        assert (
+            layer(
+                source,
+                round_before_bias=True,
+                output_dtype=output_dtype,
+                out=out,
+            )
+            is out
+        )
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "dtype,large", ((torch.float16, 2048), (torch.bfloat16, 256))
+)
 @pytest.mark.parametrize(
     "device", ("cpu", pytest.param("cuda", marks=pytest.mark.gpu))
 )
@@ -135,7 +200,8 @@ def test_calibrated_nvfp4_projection_chunks_match_complete_input():
 
 
 @pytest.mark.parametrize("axis", [None, 0])
-def test_encoded_input_preserves_scales_shape_and_bias(axis):
+@pytest.mark.parametrize("round_before_bias", [False, True])
+def test_encoded_input_preserves_scales_shape_and_bias(axis, round_before_bias):
     quantizer = Quantizer("fp8", axis=axis)
     layer = Linear(2, 2)
     weights = torch.tensor([[448.0, 2.0], [-4.0, 448.0]])
@@ -150,10 +216,21 @@ def test_encoded_input_preserves_scales_shape_and_bias(axis):
         encoded.dequantize(), layer.weight.dequantize(), layer.bias
     ).reshape(1, 2, 2)
     out = torch.empty(1, 2, 2).transpose(-1, -2)
-    assert layer(source, output_dtype=torch.float32, out=out) is out
+    assert (
+        layer(
+            source,
+            round_before_bias=round_before_bias,
+            output_dtype=torch.float32,
+            out=out,
+        )
+        is out
+    )
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
     torch.testing.assert_close(
-        layer(encoded), expected.reshape(2, 2), rtol=0, atol=0
+        layer(encoded, round_before_bias=round_before_bias),
+        expected.reshape(2, 2),
+        rtol=0,
+        atol=0,
     )
 
 

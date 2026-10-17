@@ -375,15 +375,66 @@ impl FrameClips {
         self.units(frames) * self.clip_latent_frames + self.tail_latent_frames
     }
 
-    /// Checks that the rule is positive and leaves a tail past the first
-    /// clip.
+    /// Checks positive clips and a consistent optional tail. Independent
+    /// clips have equal minimum and clip lengths and no latent tail.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             self.clip_frames > 0
-                && self.min_frames > self.clip_frames
+                && self.min_frames >= self.clip_frames
                 && self.clip_latent_frames > 0
-                && self.tail_latent_frames > 0,
+                && (self.min_frames == self.clip_frames) == (self.tail_latent_frames == 0),
             "a video denoiser declares an empty frame rule"
+        );
+        Ok(())
+    }
+}
+
+/// A fixed retained camera grid and the decoded clip taken from each view.
+///
+/// A retained column may anchor generation without contributing a decoded
+/// latent frame. The output frame count therefore follows this declaration,
+/// rather than inferring the retained grid from the VAE clip rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraLayout {
+    /// Camera views in the retained latent grid.
+    pub views: u32,
+    /// Retained latent columns per camera view.
+    pub columns: u32,
+    /// Flattening order of the retained camera grid.
+    pub order: uniserve_core::CameraOrder,
+    /// Decoded RGB frames contributed by each view.
+    pub frames_per_view: u32,
+    /// Latent frames decoded per view, excluding retained-only columns.
+    pub latent_frames_per_view: u32,
+}
+
+impl CameraLayout {
+    /// Checks representable grid/output sizes and compatibility with the
+    /// denoiser's VAE frame rule.
+    pub fn validate(&self, frames: &FrameClips) -> ValidationResult<()> {
+        frames.validate()?;
+        ensure_valid!(
+            self.views
+                .checked_mul(self.columns)
+                .is_some_and(|cells| cells > 0)
+                && self
+                    .views
+                    .checked_mul(self.frames_per_view)
+                    .is_some_and(|count| count > 0)
+                && self.latent_frames_per_view > 0
+                && self.latent_frames_per_view <= self.columns,
+            "a camera layout needs positive representable grid and output dimensions"
+        );
+        let legal = self.frames_per_view >= frames.min_frames
+            && (self.frames_per_view - frames.min_frames).is_multiple_of(frames.clip_frames);
+        let decoded = frames
+            .units(self.frames_per_view)
+            .checked_mul(frames.clip_latent_frames)
+            .and_then(|count| count.checked_add(frames.tail_latent_frames));
+        ensure_valid!(
+            legal && frames.tail_latent_frames == 0 && decoded == Some(self.latent_frames_per_view),
+            "a camera layout's per-view decoded frames must match its VAE frame rule"
         );
         Ok(())
     }
@@ -402,7 +453,7 @@ pub struct VideoDenoiserInfo {
     pub schedule_points: u32,
     /// Shift of the video schedule.
     pub video_shift: f64,
-    /// Shift of the audio schedule.
+    /// Shift of the audio schedule; zero when no audio is generated.
     pub audio_shift: f64,
     /// Frame rate, in frames per second, of every video the deployment
     /// generates: the output clock durations and reference videos are
@@ -414,6 +465,10 @@ pub struct VideoDenoiserInfo {
     /// How the VAE divides a video's frames into clips, which counts frames
     /// and decode units.
     pub frames: FrameClips,
+    /// Optional fixed camera grid and per-view output geometry. Absence
+    /// preserves the direct frame-rule mapping from output to latent cells.
+    #[serde(default)]
+    pub camera_layout: Option<CameraLayout>,
     /// The only canvases the deployment serves: those it prepares, in the
     /// order its operator selected them.
     #[serde(default)]
@@ -442,9 +497,13 @@ impl VideoDenoiserInfo {
         );
         ensure_valid!(
             self.schedule_points >= 2
-                && [self.video_shift, self.audio_shift]
-                    .iter()
-                    .all(|shift| shift.is_finite() && *shift > 0.0),
+                && self.video_shift.is_finite()
+                && self.video_shift > 0.0
+                && if self.audio_sample_rate == 0 {
+                    self.audio_shift == 0.0
+                } else {
+                    self.audio_shift.is_finite() && self.audio_shift > 0.0
+                },
             "a video denoiser schedule needs points and positive shifts"
         );
         ensure_valid!(
@@ -452,6 +511,9 @@ impl VideoDenoiserInfo {
             "a video denoiser declares no frame rate"
         );
         self.frames.validate()?;
+        if let Some(layout) = self.camera_layout {
+            layout.validate(&self.frames)?;
+        }
         ensure_valid!(
             self.canvases.iter().all(|served| {
                 served.short_edge > 0

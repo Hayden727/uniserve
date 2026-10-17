@@ -615,6 +615,7 @@ fn prepare_request(
             prompt: request.prompt,
             task: VideoTask::T2va,
             conditions: Vec::new(),
+            camera: None,
             target: VideoTarget {
                 short_edge: raster.short_edge,
                 aspect_ratio: raster.aspect_ratio.clone(),

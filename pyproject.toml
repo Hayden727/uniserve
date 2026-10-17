@@ -141,6 +141,9 @@ extend-exclude = [
     ".venv",
     # Preserve upstream style for the vendored FlashInfer MegaMoE sources.
     "uniserve_kernels/src/uniserve_kernels/megamoe",
+    # Preserve numerical fragment names and source structure in the private
+    # FlashAttention forward port, with provenance in SPARSE_SOURCES.json.
+    "uniserve_kernels/src/uniserve_kernels/attention/_sparse_sm100",
 ]
 
 [tool.ruff.lint]

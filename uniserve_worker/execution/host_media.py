@@ -36,6 +36,7 @@ from uniserve_worker.media.mux import (
 )
 from uniserve_worker.protocol.call import Call, CallStatus, MediaCall
 from uniserve_worker.protocol.output import FinishFlags
+from uniserve_worker.protocol.tensor import DType
 from uniserve_worker.protocol.transfer import (
     ChannelTransfer,
     LocalTransfer,
@@ -277,8 +278,9 @@ def execute(
     ``host.finish``, which frames and publishes the encoded rows once every
     encode has completed. Audio encodes and unit appends leave their results
     in the request's mux session; the task of the final mux call, which
-    carries no inputs, results in a ``MediaOutput`` holding the assembled
-    artifact's handle.
+    carries no inputs for ordinary video or one native latent for a camera
+    bundle, produces the assembled artifact. Camera bytes are published only
+    when the pending output materializes.
 
     Raises:
         WorkerError: When, for example, the call's inputs, reservations or
@@ -439,6 +441,8 @@ def execute(
         if media_mux is None:
             raise unsupported_setup("audio encoding has no muxer resources")
         config = mux_config(model_executor, media)
+        if config.audio_rate == 0:
+            raise invalid_descriptor("video-only media has no audio track")
         media_mux.open(call.request_key, config=config)
         if len(call.inputs) != 1:
             raise invalid_descriptor("audio encoding requires one PCM input")
@@ -463,6 +467,66 @@ def execute(
         )
 
     elif call.kind is MediaCall.MUXING:
+        video_input = request.request.admission.video
+        camera = None if video_input is None else video_input.camera
+        # Encoded units are uint8 byte rows. A camera request's final mux
+        # instead consumes the complete floating native latent product, after
+        # all preview units (when requested) have already been appended.
+        camera_final = camera is not None and any(
+            product.dtype in {DType.BF16, DType.F16, DType.F32}
+            for product in call.inputs
+        )
+        if camera_final:
+            if len(call.inputs) != 1:
+                raise invalid_descriptor(
+                    "camera finalization requires one native latent product"
+                )
+            from uniserve_worker.execution.camera import camera_result
+            from uniserve_worker.media.camera_result import dump_camera_result
+
+            read = tensor_store.consume(
+                call.inputs[0],
+                consumer_call_id=call.call_id,
+                device=model_executor.call_devices(call)[0],
+            )
+            request.device_reads.append(read)
+            if read.region is not None or read.tensor is None:
+                raise invalid_descriptor(
+                    "camera finalization requires complete latent coverage"
+                )
+            result = camera_result(
+                model_executor, request.request.admission, read.tensor
+            )
+            if camera.include_video:
+                if media_mux is None:
+                    raise unsupported_setup(
+                        "camera preview assembly has no muxer resources"
+                    )
+                tasks = (
+                    media_mux.finalize_artifact(
+                        call.request_key,
+                        reservations[0],
+                        call.call_id,
+                        camera=result,
+                    ),
+                )
+            else:
+                tasks = (
+                    reservations[0].configure(
+                        lambda: dump_camera_result(result),
+                        profile_name=(
+                            "uniserve.host.camera "
+                            f"request={call.request_key.request_id}"
+                        ),
+                    ),
+                )
+            request.status = CallStatus.OK
+            request.progress = calls.execution_runtime(request, None)
+            request.finish_flags = FinishFlags()
+            request.host.tasks = tasks
+            request.host.finish = None
+            request.products = ()
+            return request
         if media_mux is None:
             raise unsupported_setup("artifact assembly has no muxer resources")
         media_mux.open(
@@ -471,8 +535,8 @@ def execute(
         # A muxing call carries the encode rounds completed since the last
         # one, one product per round in media unit order, and the muxer
         # appends them to the request's container. The final call carries
-        # none: every unit and the audio track are in, and it assembles the
-        # artifact.
+        # none: every unit and any configured audio track are in, and it
+        # assembles the artifact.
         units: list[bytes] = []
         for index, product in enumerate(call.inputs):
             if product.buffer_id in state.borrowed_inputs:

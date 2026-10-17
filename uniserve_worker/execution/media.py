@@ -96,6 +96,7 @@ def video_shape(runner: ModelExecutor, admission: NewRequest):
             media.canvas,
             conditions=library_conditions(video),
             vision_spans=video.vision_spans(),
+            camera_grid=None if video.camera is None else video.camera.grid,
         )
     except ValueError as error:
         raise invalid_descriptor(str(error)) from error
@@ -642,7 +643,11 @@ def mux_config(runner: ModelExecutor, media) -> AvMuxConfig:
         height=media.height,
         frame_count=media.num_frames,
         frame_rate=runner.video_postprocessor.frame_rate,
-        audio_rate=runner.audio_decoder.sample_rate,
+        audio_rate=(
+            0
+            if runner.audio_decoder is None
+            else runner.audio_decoder.sample_rate
+        ),
         video_unit_frames=tuple(clip.stop - clip.start for clip in clips),
     )
 
@@ -775,6 +780,7 @@ def begin_noise(
             media.canvas,
             conditions=library_conditions(video),
             vision_spans=video.vision_spans(),
+            camera_grid=None if video.camera is None else video.camera.grid,
         )
     except ValueError as error:
         request.refusal = str(error)
@@ -794,6 +800,7 @@ def begin_noise(
         trajectory.size,
         slot.tensors["denoising"],
         seed=media.seed,
+        camera=video.camera,
     )
 
 
@@ -879,9 +886,30 @@ def execute(
         encoded = conditioning.tensor
         staging = bound_slot(trajectory).staging
         if staging is None:
-            builder.stage_request(numerical_shape, slot, seed=media.seed)
+            archive = builder.stage_request(
+                numerical_shape,
+                slot,
+                seed=media.seed,
+                camera=None if video_inputs is None else video_inputs.camera,
+            )
         else:
-            staging.result()
+            archive = staging.result()
+        if archive is not None:
+            from uniserve_worker.execution.camera import encode_camera
+
+            result = encode_camera(
+                model_executor,
+                numerical_shape,
+                video_inputs.camera,
+                archive,
+                slot,
+            )
+            if result is not None:
+                if result.stats is None:
+                    raise RuntimeError(
+                        "camera encoding has no execution statistics"
+                    )
+                state.forward_stats.append(result.stats)
 
         # The initial samples are copied straight into the request's pages
         # of the bank a fresh trajectory starts in, overlapping the
@@ -917,6 +945,12 @@ def execute(
                 builder.store_conditioning(
                     numerical_shape, slot, result.values[0]
                 )
+            else:
+                if encoded is None:
+                    raise invalid_descriptor(
+                        "text encoding has no input Tensor"
+                    )
+                builder.store_conditioning(numerical_shape, slot, encoded)
             if conditioned:
                 from uniserve_worker.execution.conditions import (
                     condition_latents,
@@ -936,6 +970,19 @@ def execute(
                         video_inputs, tuple(read.tensor for read in reads[1:])
                     ),
                 )
+        if archive is not None:
+            from uniserve_worker.execution.camera import prepare_camera
+
+            # The preparation context joins the host-to-device copies. Device
+            # camera math overwrites those same state fields, so it must run
+            # after the join instead of racing their staging stream.
+            prepare_camera(
+                model_executor,
+                numerical_shape,
+                video_inputs.camera,
+                archive,
+                slot,
+            )
         request.latent.update = sample_update(
             slot_index, params, step_index=0, previous=None
         )
@@ -1004,12 +1051,17 @@ def execute(
                 raise invalid_descriptor(
                     "final latent products require completed denoising"
                 )
+            video_input = request.request.admission.video
+            # Camera artifacts consume the complete latent on a host rank.
+            # Host publication also serves an optional GPU preview decoder;
+            # a device-only VMM location cannot reach the host exporter.
             products = transfer.publish_tensors(
                 call,
                 result.values,
                 tensor_store=tensor_store,
                 publication_transports=publication_transports,
                 state=state,
+                host=video_input is not None and video_input.camera is not None,
             )
 
     elif call.kind in {MediaCall.VIDEO_DECODING, MediaCall.AUDIO_DECODING}:

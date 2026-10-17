@@ -123,6 +123,9 @@ impl Scheduler {
                         &pools.rank_buffer_bytes(id),
                         components,
                         &info.media_components,
+                        info.video_denoiser.as_ref().is_some_and(|denoiser| {
+                            denoiser.tasks.iter().any(|task| task == "camera2v")
+                        }),
                     ),
                 )
             })

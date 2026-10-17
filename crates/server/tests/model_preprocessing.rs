@@ -70,6 +70,7 @@ fn base_denoiser() -> VideoDenoiserInfo {
         audio_shift: 3.0,
         frame_rate: 24,
         audio_sample_rate: 32_000,
+        camera_layout: None,
         frames: uniserve_engine::FrameClips {
             min_frames: 22,
             clip_frames: 17,
@@ -746,6 +747,7 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         audio_shift: 3.0,
         frame_rate: 24,
         audio_sample_rate: 32_000,
+        camera_layout: None,
         frames: uniserve_engine::FrameClips {
             min_frames: 22,
             clip_frames: 17,

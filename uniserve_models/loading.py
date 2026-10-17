@@ -61,6 +61,7 @@ _catalog: Mapping[str, str] = MappingProxyType(
         "DiffusionGemmaForBlockDiffusion": "uniserve_models.diffusion_gemma",
         "NEOChatModel": "uniserve_models.sensenova_u1",
         "MiniMaxH3ModularPipeline": "uniserve_models.minimax_h3",
+        "WanCameraPipeline": "uniserve_models.wan",
     }
 )
 

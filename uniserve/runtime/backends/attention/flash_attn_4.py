@@ -210,7 +210,9 @@ class _FlashAttentionOperator(_Operator):
         if isinstance(batch, DenseInput):
             packed = q.ndim == 3
             query, key, value = (
-                tensor.unsqueeze(0) if packed else tensor.transpose(1, 2)
+                (
+                    tensor.unsqueeze(0) if packed else tensor.transpose(1, 2)
+                ).contiguous()
                 for tensor in (q, k, v)
             )
             destination = out.unsqueeze(0) if packed else out.transpose(1, 2)
@@ -220,6 +222,7 @@ class _FlashAttentionOperator(_Operator):
                 value,
                 softmax_scale=scale,
                 causal=batch.causal,
+                num_splits=1,
                 out=destination,
             )
             return out

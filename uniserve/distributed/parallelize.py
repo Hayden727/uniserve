@@ -10,8 +10,10 @@ from torch.distributed.tensor import Replicate, Shard
 
 from uniserve.nn.attention._parallel import ParallelAttention
 from uniserve.nn.attention.config import AttentionParallelConfig
+from uniserve.nn.attention.grid import GridAttention
 from uniserve.nn.attention.layer import Attention
 from uniserve.nn.attention.vsa import SegmentAttention
+from uniserve.nn.attention.vsa.tiles import TileAttention
 from uniserve.nn.linear import (
     ColumnParallelLinear,
     Linear,
@@ -77,7 +79,9 @@ def _communication_axes(module, mesh, attention):
         if isinstance(child, (Denoiser, TransformerDecoder)):
             add("pp")
             add(*tokens)
-        if isinstance(child, (Attention, SegmentAttention)):
+        if isinstance(
+            child, (GridAttention, TileAttention, Attention, SegmentAttention)
+        ) and not (isinstance(child, Attention) and child.replicated_kv):
             add(head)
             add(context)
         if isinstance(child, FusedMoE):
@@ -456,6 +460,40 @@ def parallelize_(
                 )
 
     for child in modules:
+        if isinstance(child, (GridAttention, TileAttention)):
+            bound = getattr(child, "_parallel_mesh", None)
+            if bound is not None:
+                if bound != mesh or child._attention_parallel != attention:
+                    raise ValueError(
+                        "grid attention cannot change its partition"
+                    )
+                continue
+            if attention.context is not None:
+                raise ValueError(
+                    "grid attention supports Ulysses, not context partitioning"
+                )
+            exchange = HeadExchange(
+                mesh.get_group(
+                    () if attention.heads is None else attention.heads.axis
+                )
+            )
+            if isinstance(child, TileAttention) and child.num_heads is None:
+                if group.size > 1 or exchange.group.size > 1:
+                    raise ValueError(
+                        "parallel tile attention requires static "
+                        "head dimensions"
+                    )
+                continue
+            if child.num_heads % (group.size * exchange.group.size):
+                raise ValueError(
+                    "grid heads must divide tensor and Ulysses membership"
+                )
+            child.local_heads = child.num_heads // (
+                group.size * exchange.group.size
+            )
+            child.exchange = exchange
+            child._parallel_mesh, child._attention_parallel = mesh, attention
+            continue
         if isinstance(child, SegmentAttention):
             bound = getattr(child, "_parallel_mesh", None)
             if bound is not None:
@@ -496,7 +534,9 @@ def parallelize_(
 
             exchange = HeadExchange(
                 mesh.get_group(
-                    () if attention.heads is None else attention.heads.axis
+                    ()
+                    if child.replicated_kv or attention.heads is None
+                    else attention.heads.axis
                 )
             )
             query_heads = child.num_heads // group.size
@@ -512,7 +552,7 @@ def parallelize_(
                 range(start + head_slice.start, start + head_slice.stop)
             )
             child.exchange = exchange
-            if attention.context is not None:
+            if attention.context is not None and not child.replicated_kv:
                 child.context_parallel = ParallelAttention(
                     mesh=mesh, parallel=attention
                 )

@@ -64,24 +64,28 @@ class _Media:
 
     config: AvMuxConfig
     units: tuple[bytes, ...]
-    audio: bytes
+    audio: bytes | None
 
 
-@pytest.fixture(scope="module")
-def media() -> _Media:
+@pytest.fixture(scope="module", params=(0, 32000))
+def media(request) -> _Media:
     config = AvMuxConfig(
         width=32,
         height=16,
         frame_count=6,
         frame_rate=24,
-        audio_rate=32000,
+        audio_rate=request.param,
         video_unit_frames=(4, 2),
     )
     units = tuple(
         encode_video_unit(config, np.zeros((frames, 16, 32, 3), np.uint8))
         for frames in config.video_unit_frames
     )
-    audio = encode_audio_track(config, np.zeros((8000, 2), np.int16))
+    audio = (
+        encode_audio_track(config, np.zeros((8000, 2), np.int16))
+        if config.audio_rate
+        else None
+    )
     return _Media(config, units, audio)
 
 

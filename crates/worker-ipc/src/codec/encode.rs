@@ -324,6 +324,25 @@ fn video_admission<'a>(
         .map(|condition| video_condition(b, condition))
         .collect::<Vec<_>>();
     let conditions = Some(b.create_vector(&conditions));
+    let camera = v.camera.as_ref().map(|input| {
+        let source_name = Some(b.create_string(&input.source.name));
+        let clean_cells = Some(b.create_vector(&input.clean_cells));
+        fbs::CameraInput::create(
+            b,
+            &fbs::CameraInputArgs {
+                source_name,
+                source_bytes: input.source.bytes,
+                views: input.grid.views,
+                columns: input.grid.columns,
+                order: match input.grid.order {
+                    uniserve_core::CameraOrder::ViewMajor => fbs::CameraOrder::ViewMajor,
+                    uniserve_core::CameraOrder::TimeMajor => fbs::CameraOrder::TimeMajor,
+                },
+                clean_cells,
+                include_video: input.include_video,
+            },
+        )
+    });
     fbs::VideoAdmission::create(
         b,
         &fbs::VideoAdmissionArgs {
@@ -331,9 +350,11 @@ fn video_admission<'a>(
                 uniserve_core::VideoTask::T2va => fbs::VideoTask::T2va,
                 uniserve_core::VideoTask::Fl2va => fbs::VideoTask::Fl2va,
                 uniserve_core::VideoTask::Ref2va => fbs::VideoTask::Ref2va,
+                uniserve_core::VideoTask::Camera2v => fbs::VideoTask::Camera2v,
             },
             text_tags,
             conditions,
+            camera,
         },
     )
 }
@@ -1361,6 +1382,21 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
                 tail_latent_frames: value.frames.tail_latent_frames,
             },
         ));
+        let camera_layout = value.camera_layout.map(|layout| {
+            fbs::CameraLayout::create(
+                b,
+                &fbs::CameraLayoutArgs {
+                    views: layout.views,
+                    columns: layout.columns,
+                    order: match layout.order {
+                        uniserve_core::CameraOrder::ViewMajor => fbs::CameraOrder::ViewMajor,
+                        uniserve_core::CameraOrder::TimeMajor => fbs::CameraOrder::TimeMajor,
+                    },
+                    frames_per_view: layout.frames_per_view,
+                    latent_frames_per_view: layout.latent_frames_per_view,
+                },
+            )
+        });
         fbs::VideoDenoiserInfo::create(
             b,
             &fbs::VideoDenoiserInfoArgs {
@@ -1373,6 +1409,7 @@ fn info<'a>(b: &mut FlatBufferBuilder<'a>, v: &WorkerInfo) -> WIPOffset<fbs::Wor
                 frames,
                 canvases,
                 references,
+                camera_layout,
             },
         )
     });

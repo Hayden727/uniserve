@@ -1,6 +1,54 @@
 """Euler integration with explicit prediction and sample mutation behavior."""
 
+from dataclasses import dataclass
 from typing import Literal, TypeAlias
+
+import torch
+
+
+@dataclass(frozen=True, slots=True)
+class ReNoiseInput:
+    """Borrow this request's independent noise and fixed clean condition.
+
+    Noise and clean tensors have the sample shape and precision. The boolean
+    mask may broadcast within that shape. Random draws happen outside this
+    numerical call, before capture, in the native generator's draw order.
+    """
+
+    noise: torch.Tensor
+    clean: torch.Tensor
+    clean_mask: torch.Tensor
+
+    def __post_init__(self):
+        if self.noise.shape != self.clean.shape:
+            raise ValueError("re-noising noise and clean shape must match")
+        if self.noise.dtype != self.clean.dtype:
+            raise ValueError("re-noising noise and clean dtype must match")
+        if self.clean_mask.dtype != torch.bool:
+            raise ValueError("clean mask must be boolean")
+        if (
+            len({self.noise.device, self.clean.device, self.clean_mask.device})
+            != 1
+        ):
+            raise ValueError("re-noising inputs must share one device")
+        try:
+            shape = torch.broadcast_shapes(
+                self.clean_mask.shape, self.clean.shape
+            )
+        except RuntimeError as error:
+            raise ValueError(
+                "clean mask shape cannot broadcast to sample"
+            ) from error
+        if shape != self.clean.shape:
+            raise ValueError("clean mask shape cannot expand sample")
+
+    def shard(self, slices):
+        """Borrow the same local slice as a sharded prediction."""
+        return ReNoiseInput(
+            self.noise[slices],
+            self.clean[slices],
+            self.clean_mask.expand_as(self.clean)[slices],
+        )
 
 
 def _output(value, out):
@@ -80,4 +128,45 @@ class CleanSampleEulerSolver:
         sample.addcmul_(prediction, 1.0 - ratio)
 
 
-Solver: TypeAlias = EulerSolver | CleanSampleEulerSolver
+class ReNoiseSolver:
+    """Predict-x0 DMD: independently re-noise, then restore clean slots.
+
+    The final zero-sigma step returns x0 exactly. No RNG or mutable request
+    state is stored on the solver, and endpoint selection stays on-device.
+    """
+
+    prediction_type = "sample"
+
+    def step_(
+        self,
+        prediction,
+        sample,
+        timestep,
+        next_timestep,
+        *,
+        sigma,
+        next_sigma,
+        inputs: ReNoiseInput | None = None,
+    ) -> None:
+        if inputs is None:
+            raise ValueError("DMD requires explicit re-noising inputs")
+        if (
+            inputs.clean.shape != sample.shape
+            or inputs.clean.dtype != sample.dtype
+            or inputs.clean.device != sample.device
+            or prediction.shape != sample.shape
+            or prediction.dtype != sample.dtype
+        ):
+            raise ValueError(
+                "re-noising inputs and prediction must match sample"
+            )
+        # Native Wan rounds sigma to latent precision before both products.
+        level = next_sigma.to(device=sample.device, dtype=sample.dtype)
+        while level.ndim < sample.ndim:
+            level = level.unsqueeze(-1)
+        renoised = (1.0 - level) * prediction + level * inputs.noise
+        result = torch.where(level == 0, prediction, renoised)
+        sample.copy_(torch.where(inputs.clean_mask, inputs.clean, result))
+
+
+Solver: TypeAlias = EulerSolver | CleanSampleEulerSolver | ReNoiseSolver

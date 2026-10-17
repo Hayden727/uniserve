@@ -496,7 +496,7 @@ def prepare_inputs(
             # Encoded rows publish initialized prefixes within their reserved
             # capacity. The mux reads those host locations directly; importing
             # the full logical tensor would require uninitialized padding.
-            if any(
+            if entry.product.dtype == DType.U8 and any(
                 call.kind is MediaCall.MUXING and entry.product in call.inputs
                 for call in batch.calls
             ):

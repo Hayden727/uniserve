@@ -437,6 +437,35 @@ class TubeletEncoder(PatchEncoder, ABC):
 
 
 class TextEncoder(Encoder[tuple[torch.Tensor, ...]]):
+    """Encode token sequences and declare their conditioning feature layout.
+
+    The supplied network exposes ``hidden_size``. Numerical subclasses may
+    preserve individual sequence lengths or pack independent samples according
+    to their attention contract.
+    """
+
+    # None requires exact sequence lengths. A token id declares that appending
+    # that token cannot change the features of the original prefix.
+    padding_token_id: int | None = None
+
+    def output_layout(self, num_tokens: int, dtype: torch.dtype):
+        """Describe per-token features in the deployment's numerical dtype."""
+        if type(num_tokens) is not int or num_tokens < 0:
+            raise ValueError("text output length must be a nonnegative integer")
+        if not dtype.is_floating_point:
+            raise ValueError("encoded conditioning requires a float dtype")
+        shape = (num_tokens, self.network.hidden_size)
+        return {
+            "conditioning": OutputLayout(
+                shape,
+                dtype,
+                tuple(slice(0, n) for n in shape),
+                variable_axes=(0,),
+            )
+        }
+
+
+class DecoderTextEncoder(TextEncoder):
     """Encode independent token sequences through the retained decoder layers.
 
     retained_layers names the checkpoint layers participating in the numerical
@@ -445,6 +474,7 @@ class TextEncoder(Encoder[tuple[torch.Tensor, ...]]):
     """
 
     network: TransformerDecoder
+    padding_token_id = 0
 
     def __init__(
         self, network: TransformerDecoder, retained_layers: tuple[int, ...]
@@ -541,31 +571,8 @@ class TextEncoder(Encoder[tuple[torch.Tensor, ...]]):
             return None
         return tuple(features.split(counts))
 
-    def output_layout(self, num_tokens: int, dtype: torch.dtype):
-        """Describe the encoded conditioning this encoder emits.
 
-        ``dtype`` is the numerical dtype the deployment runs the encoder at,
-        which is what its hidden states carry. The caller supplies it because
-        every rank of a deployment declares this product, including the ranks
-        that never materialize the encoder's parameters and could read no
-        representation from them.
-        """
-        if type(num_tokens) is not int or num_tokens < 0:
-            raise ValueError("text output length must be a nonnegative integer")
-        if not dtype.is_floating_point:
-            raise ValueError("encoded conditioning requires a float dtype")
-        shape = (num_tokens, self.network.hidden_size)
-        return {
-            "conditioning": OutputLayout(
-                shape,
-                dtype,
-                tuple(slice(0, n) for n in shape),
-                variable_axes=(0,),
-            )
-        }
-
-
-class MultimodalEncoder(TextEncoder, ABC):
+class MultimodalEncoder(DecoderTextEncoder, ABC):
     """Encode prompts whose placeholder tokens stand for vision tokens.
 
     ``vision`` encodes images and video blocks into one row per vision token

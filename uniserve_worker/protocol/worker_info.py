@@ -188,6 +188,26 @@ class FrameClips:
 
 
 @dataclass(frozen=True, slots=True)
+class CameraLayout:
+    """Complete latent grid and independently decoded camera trajectories."""
+
+    views: int
+    columns: int
+    order: str
+    frames_per_view: int
+    latent_frames_per_view: int
+
+    def to_mapping(self):
+        return {
+            "views": self.views,
+            "columns": self.columns,
+            "order": self.order,
+            "frames_per_view": self.frames_per_view,
+            "latent_frames_per_view": self.latent_frames_per_view,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class VideoDenoiserInfo:
     """What the video denoiser a deployment places serves.
 
@@ -210,6 +230,7 @@ class VideoDenoiserInfo:
     frames: FrameClips
     canvases: tuple[ServedCanvas, ...] = ()
     references: ReferenceLimits = ReferenceLimits()
+    camera_layout: CameraLayout | None = None
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -227,6 +248,9 @@ class VideoDenoiserInfo:
                 "audios": self.references.audios,
                 "total": self.references.total,
             },
+            "camera_layout": None
+            if self.camera_layout is None
+            else self.camera_layout.to_mapping(),
         }
 
 

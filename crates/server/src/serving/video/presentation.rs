@@ -15,10 +15,15 @@
 //! `<|video_pad|>` per vision token, and `<|vision_end|>`. Its tokens,
 //! markers included, carry the video tag ([`VIDEO_TAG`]); every other token
 //! carries the text tag ([`TEXT_TAG`]).
+//!
+//! `camera2v` presents plain text with its tokenizer's terminal special token
+//! and a 512-token limit. Its whitespace normalization does not yet implement
+//! the native caption cleaner's `ftfy` repair and two HTML-unescape passes.
 
 use std::borrow::Cow;
 
 use thiserror_ext::AsReport as _;
+use uniserve_core::VideoTask;
 
 use super::plan::{Prepared, RequestPlan, Vision};
 use super::{RequestField, VideoInputError};
@@ -31,6 +36,7 @@ pub const TEXT_TAG: u8 = 1;
 
 const VISION_START: &str = "<|vision_start|>";
 const VISION_END: &str = "<|vision_end|>";
+const CAMERA_PROMPT_TOKENS: usize = 512;
 
 /// The placeholder a vision block's tokens are written as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,8 +128,8 @@ pub struct Presentation {
 ///
 /// # Errors
 ///
-/// Returns [`VideoInputError::Invalid`] for `prompt` when the prompt is blank
-/// or contains a vision placeholder or marker, which would misalign the
+/// Returns [`VideoInputError::Invalid`] for `prompt` when a vision prompt is
+/// blank or contains a vision placeholder or marker, which would misalign the
 /// conditioner's vision inputs, and [`VideoInputError::Internal`] when the
 /// tokenizer fails or lacks the vision tokens a vision block needs.
 pub fn present(
@@ -131,6 +137,11 @@ pub fn present(
     plan: &RequestPlan,
     prompt: &str,
 ) -> Result<Presentation, VideoInputError> {
+    // Camera conditioning permits an empty text prompt. The native text
+    // tokenizer still supplies EOS; it is not an absent conditioning tensor.
+    if plan.task == VideoTask::Camera2v {
+        return camera_prompt(tokenizer, prompt);
+    }
     if prompt.trim().is_empty() {
         return Err(VideoInputError::invalid(
             RequestField::Prompt,
@@ -190,15 +201,63 @@ pub fn present(
     Ok(Presentation { token_ids, tags })
 }
 
+fn camera_prompt(
+    tokenizer: &HuggingFaceTokenizer,
+    prompt: &str,
+) -> Result<Presentation, VideoInputError> {
+    let encode = |text| {
+        tokenizer.encode(text, true).map_err(|error| {
+            VideoInputError::internal(format!(
+                "tokenizing the camera prompt failed: {}",
+                error.as_report()
+            ))
+        })
+    };
+    // UMT5 adds exactly one EOS to an empty sequence. Derive it from the
+    // tokenizer so truncation preserves the checkpoint's terminal token.
+    let special = encode("")?;
+    let [eos] = special.as_slice() else {
+        return Err(VideoInputError::internal(
+            "the camera tokenizer must append exactly one terminal special token",
+        ));
+    };
+    if !tokenizer.is_special_id(*eos) {
+        return Err(VideoInputError::internal(
+            "the camera tokenizer's terminal token must be special",
+        ));
+    }
+    // Full native ftfy/HTML preprocessing remains a separate admission
+    // requirement; this only normalizes Unicode whitespace.
+    let prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut token_ids = tokenizer.encode(&prompt, false).map_err(|error| {
+        VideoInputError::internal(format!(
+            "tokenizing the camera prompt failed: {}",
+            error.as_report()
+        ))
+    })?;
+    // The trained tokenizer reserves one terminal slot before truncation,
+    // then appends EOS only when the content does not already end with it.
+    // Explicit repeated EOS tokens are content and remain intact.
+    token_ids.truncate(CAMERA_PROMPT_TOKENS - 1);
+    if token_ids.last() != Some(eos) {
+        token_ids.push(*eos);
+    }
+    let tags = vec![TEXT_TAG; token_ids.len()];
+    Ok(Presentation { token_ids, tags })
+}
+
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use std::borrow::Cow;
 
     use serde_json::Value;
     use tokenizers::models::bpe::{BPE, Vocab};
+    use tokenizers::processors::template::TemplateProcessing;
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
+    use uniserve_core::{Canvas, VideoTask};
 
     use super::super::RequestField;
+    use super::super::plan::RequestPlan;
     use super::super::plan::tests::{Request, fixture, vision};
     use super::{Segment, TEXT_TAG, VIDEO_TAG, VisionPad, present, segments};
     use crate::profile::assets::PipelineCheckpoint;
@@ -300,6 +359,96 @@ pub(super) mod tests {
         let path = directory.path().join("tokenizer.json");
         tokenizer.save(&path, false).unwrap();
         HuggingFaceTokenizer::new(&path).unwrap()
+    }
+
+    /// Plain ASCII text with a terminal EOS and no vision vocabulary.
+    pub(crate) fn camera_tokenizer() -> HuggingFaceTokenizer {
+        let mut vocab: Vocab = (1_u32..=127)
+            .map(|id| (char::from_u32(id).unwrap().to_string(), id))
+            .collect();
+        vocab.insert("<unk>".to_owned(), 0);
+        vocab.insert("</s>".to_owned(), 128);
+        let model = BPE::builder()
+            .vocab_and_merges(vocab, Vec::new())
+            .unk_token("<unk>".to_owned())
+            .build()
+            .unwrap();
+        let mut tokenizer = TokenizerBuilder::new(model);
+        tokenizer.add_special_tokens(&[AddedToken::from("</s>", true)]);
+        tokenizer.with_post_processor(Some(
+            TemplateProcessing::builder()
+                .try_single("$A </s>")
+                .unwrap()
+                .special_tokens(vec![("</s>", 128)])
+                .build()
+                .unwrap(),
+        ));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tokenizer.json");
+        tokenizer.save(&path, false).unwrap();
+        HuggingFaceTokenizer::new(&path).unwrap()
+    }
+
+    fn camera_plan() -> RequestPlan {
+        RequestPlan {
+            task: VideoTask::Camera2v,
+            canvas: Canvas {
+                width: 32,
+                height: 32,
+            },
+            duration_seconds: 13.0 / 24.0,
+            num_frames: 13,
+            conditions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn camera_prompts_are_plain_text_with_unicode_whitespace_normalized_and_eos() {
+        let presentation = present(
+            &camera_tokenizer(),
+            &camera_plan(),
+            " \tgo\u{a0}\n now\u{2003} ",
+        )
+        .unwrap();
+        assert_eq!(presentation.token_ids, [103, 111, 32, 110, 111, 119, 128]);
+        assert_eq!(presentation.tags, [TEXT_TAG; 7]);
+    }
+
+    #[test]
+    fn camera_prompt_truncation_preserves_the_terminal_token() {
+        let tokenizer = camera_tokenizer();
+        for length in [510, 511, 512, 700] {
+            let presentation = present(&tokenizer, &camera_plan(), &"a".repeat(length)).unwrap();
+            let content_length = length.min(511);
+            let mut expected = vec![97; content_length];
+            expected.push(128);
+            assert_eq!(presentation.token_ids, expected);
+            assert_eq!(presentation.tags, vec![TEXT_TAG; content_length + 1]);
+        }
+    }
+
+    #[test]
+    fn camera_prompts_require_a_tokenizer_with_terminal_special_processing() {
+        assert!(present(&character_tokenizer(), &camera_plan(), "go").is_err());
+    }
+
+    #[test]
+    fn camera_prompt_preserves_explicit_terminal_tokens() {
+        let tokenizer = camera_tokenizer();
+        let plan = camera_plan();
+        for (text, expected) in [("a</s>", vec![97, 128]), ("a</s></s>", vec![97, 128, 128])] {
+            assert_eq!(
+                present(&tokenizer, &plan, text).unwrap().token_ids,
+                expected
+            );
+        }
+        let text = format!("{}</s>z", "a".repeat(510));
+        let mut expected = vec![97; 510];
+        expected.push(128);
+        assert_eq!(
+            present(&tokenizer, &plan, &text).unwrap().token_ids,
+            expected
+        );
     }
 
     /// Vision blocks are tagged video, markers included; labels and the
