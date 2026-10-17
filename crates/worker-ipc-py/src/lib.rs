@@ -662,7 +662,7 @@ impl PyDescriptorGrants {
         py.detach(|| self.grants.release(publication_id));
     }
 
-    /// Stops serving and removes the socket; closing again does nothing.
+    /// Stops serving and releases its address; closing again does nothing.
     fn close(&self, py: Python<'_>) {
         py.detach(|| self.grants.close());
     }

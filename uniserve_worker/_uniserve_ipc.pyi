@@ -200,7 +200,8 @@ class DescriptorGrants:
     def __new__(cls, address: str) -> Self:
         """Bind the grant socket at `address` and start serving it.
 
-        The parent directory is created when missing.
+        A leading NUL selects a Linux abstract name. Filesystem addresses
+        have their parent directory created when missing.
 
         Raises:
             OSError: The socket cannot be created or bound, as when one
@@ -221,7 +222,7 @@ class DescriptorGrants:
         """Withdraw a publication; no grant of it is in flight on return."""
 
     def close(self) -> None:
-        """Stop serving and remove the socket; closing again does nothing."""
+        """Stop serving and release its address; closing again does nothing."""
 
 @final
 class StreamSignal:

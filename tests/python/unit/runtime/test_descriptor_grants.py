@@ -77,6 +77,31 @@ def test_a_registered_descriptor_opens_the_same_file_in_a_consumer() -> None:
         assert value == _identity(source.fileno())
 
 
+def test_descriptor_grants_work_with_a_long_temporary_directory(
+    tmp_path, monkeypatch
+) -> None:
+    directory = tmp_path / ("nested-temporary-directory-" * 5)
+    directory.mkdir()
+    monkeypatch.setenv("TMPDIR", str(directory))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    endpoint = f"uniserve-publications-{uuid.uuid4().hex}"
+    publication = uuid.uuid4().hex
+    with tempfile.TemporaryFile() as source:
+        grants = serve(endpoint)
+        grants.register(publication, source.fileno())
+        try:
+            assert _in_child(endpoint, publication) == (
+                "granted",
+                _identity(source.fileno()),
+            )
+        finally:
+            grants.close()
+
+    # A closed producer must not keep its endpoint reserved in the kernel.
+    replacement = serve(endpoint)
+    replacement.close()
+
+
 def test_a_withdrawn_publication_is_refused() -> None:
     endpoint = f"uniserve-publications-{uuid.uuid4().hex}"
     grants = serve(endpoint)

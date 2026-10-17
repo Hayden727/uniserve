@@ -50,7 +50,8 @@ type PublicationId = [u8; REQUEST_BYTES];
 /// time on the server thread, and every method may be called from any thread.
 pub struct DescriptorGrants {
     table: Arc<Mutex<HashMap<PublicationId, RawFd>>>,
-    address: PathBuf,
+    // Abstract socket names have no filesystem entry to remove.
+    address: Option<PathBuf>,
     // Readable once `close` asks the server thread, which owns the listener,
     // to stop.
     stop: OwnedFd,
@@ -60,12 +61,18 @@ pub struct DescriptorGrants {
 impl DescriptorGrants {
     /// Binds the grant socket at `address` and starts serving it.
     ///
-    /// The parent directory is created when missing. Binding fails when a
-    /// socket already exists at `address`.
+    /// A leading NUL selects a Linux abstract socket name. Filesystem
+    /// addresses have their parent directory created when missing. Binding
+    /// fails when a socket already exists at `address`.
     pub fn bind(address: &Path) -> io::Result<Self> {
-        if let Some(parent) = address.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let filesystem_address = if address.as_os_str().as_bytes().starts_with(b"\0") {
+            None
+        } else {
+            if let Some(parent) = address.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            Some(address.to_path_buf())
+        };
         let listener = listen(address)?;
         // SAFETY: `eventfd` has no memory preconditions; a negative result is
         // checked before the descriptor is owned.
@@ -73,7 +80,9 @@ impl DescriptorGrants {
         {
             Ok(stop) => stop,
             Err(error) => {
-                let _ = std::fs::remove_file(address);
+                if let Some(address) = &filesystem_address {
+                    let _ = std::fs::remove_file(address);
+                }
                 return Err(error);
             }
         };
@@ -89,13 +98,15 @@ impl DescriptorGrants {
         let server = match server {
             Ok(server) => server,
             Err(error) => {
-                let _ = std::fs::remove_file(address);
+                if let Some(address) = &filesystem_address {
+                    let _ = std::fs::remove_file(address);
+                }
                 return Err(error);
             }
         };
         Ok(Self {
             table,
-            address: address.to_path_buf(),
+            address: filesystem_address,
             stop,
             server: Mutex::new(Some(server)),
         })
@@ -121,7 +132,7 @@ impl DescriptorGrants {
         }
     }
 
-    /// Stops serving, joins the server thread and removes the socket.
+    /// Stops serving, joins the server thread and releases the socket name.
     ///
     /// Registered descriptors are forgotten, not closed. Closing again does
     /// nothing.
@@ -135,7 +146,9 @@ impl DescriptorGrants {
         // accepts one 8-byte counter increment.
         let _ = unsafe { libc::write(self.stop.as_raw_fd(), signal.as_ptr().cast(), signal.len()) };
         let _ = server.join();
-        let _ = std::fs::remove_file(&self.address);
+        if let Some(address) = &self.address {
+            let _ = std::fs::remove_file(address);
+        }
     }
 }
 
@@ -305,11 +318,14 @@ fn listen(address: &Path) -> io::Result<OwnedFd> {
     let mut name: libc::sockaddr_un = unsafe { mem::zeroed() };
     name.sun_family = libc::AF_UNIX as libc::sa_family_t;
     let path = address.as_os_str().as_bytes();
-    if path.len() >= name.sun_path.len() {
+    let abstract_name = path.starts_with(b"\0");
+    if path.len() > name.sun_path.len()
+        || (!abstract_name && (path.len() == name.sun_path.len() || path.contains(&0)))
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "grant socket path {} exceeds the socket name length",
+                "grant socket address {} is invalid or exceeds the socket name length",
                 address.display()
             ),
         ));
@@ -317,12 +333,19 @@ fn listen(address: &Path) -> io::Result<OwnedFd> {
     for (slot, byte) in name.sun_path.iter_mut().zip(path) {
         *slot = *byte as libc::c_char;
     }
+    // Every byte in an abstract name counts, including trailing zeros. Pass
+    // its exact length so Python consumers connect to the same kernel name.
+    let address_bytes = if abstract_name {
+        mem::offset_of!(libc::sockaddr_un, sun_path) + path.len()
+    } else {
+        mem::size_of::<libc::sockaddr_un>()
+    };
     // SAFETY: `name` is a valid `sockaddr_un` of the size passed.
     check(unsafe {
         libc::bind(
             listener.as_raw_fd(),
             (&raw const name).cast(),
-            mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            address_bytes as libc::socklen_t,
         )
     })?;
     // SAFETY: `listener` is a bound socket.

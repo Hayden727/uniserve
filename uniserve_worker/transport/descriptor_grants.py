@@ -9,9 +9,8 @@ socket, which is what this module provides.
 
 The producing transport serves one socket per address space, named after the
 endpoint its locators already carry, so a consumer holding a locator can reach
-the grant without any additional field. Every rank of a deployment whose
-devices export descriptors runs on one host and is started by one engine, so
-they agree on the directory below.
+the grant without any additional field. Linux abstract socket names keep these
+host-local endpoints independent of temporary-directory path lengths.
 
 The producer side, `DescriptorGrants`, serves from a native thread of the
 `_uniserve_ipc` extension that never takes the GIL. A producer's device work
@@ -24,11 +23,10 @@ consumer's read thread, whose blocking socket calls release the GIL.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import socket
 import sys
-import tempfile
-from pathlib import Path
 
 from uniserve_worker._uniserve_ipc import (
     GRANT_GRANTED,
@@ -46,13 +44,12 @@ _GRANTED = bytes([GRANT_GRANTED])
 _TIMEOUT_SECONDS = 30.0
 
 
-def _directory() -> Path:
-    return Path(tempfile.gettempdir()) / "uniserve-descriptor-grants"
-
-
-def address_of(endpoint: str) -> Path:
-    """Return the socket a given publishing endpoint serves its grants on."""
-    return _directory() / f"{endpoint}.sock"
+def address_of(endpoint: str) -> str:
+    """Return a bounded, user-scoped Linux abstract address for a producer."""
+    # sun_path has a fixed byte budget even when TMPDIR is a valid long path.
+    # Hash the opaque endpoint identity; every consumer derives the same name.
+    digest = hashlib.sha256(endpoint.encode()).hexdigest()
+    return f"\0uniserve-grants-{os.getuid()}-{digest}"
 
 
 def serve(endpoint: str) -> DescriptorGrants:
@@ -68,7 +65,7 @@ def serve(endpoint: str) -> DescriptorGrants:
     Raises:
         OSError: The socket cannot be bound at `address_of(endpoint)`.
     """
-    return DescriptorGrants(str(address_of(endpoint)))
+    return DescriptorGrants(address_of(endpoint))
 
 
 def fetch(endpoint: str, publication_id: str) -> int:
@@ -88,7 +85,7 @@ def fetch(endpoint: str, publication_id: str) -> int:
     try:
         connection.settimeout(_TIMEOUT_SECONDS)
         try:
-            connection.connect(str(address))
+            connection.connect(address)
         except OSError as error:
             raise invalid_descriptor(
                 "CUDA publication endpoint serves no descriptor grants"
